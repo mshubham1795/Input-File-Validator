@@ -1,0 +1,68 @@
+{
+  "version": 1,
+  "locale": "en_US.UTF-8",
+  "metadata": {
+    "appmode": "python-streamlit",
+    "entrypoint": "app.py",
+    "primary_document": "app.py",
+    "primary_rmd": null,
+    "content_category": "",
+    "has_parameters": false
+  },
+  "python": {
+    "version": "3.13.14",
+    "package_manager": {
+      "name": "pip",
+      "version": null,
+      "package_file": "requirements.txt"
+    }
+  },
+  "packages": {
+    "streamlit": {
+      "source": "pip",
+      "version": "1.57.0"
+    },
+    "pandas": {
+      "source": "pip",
+      "version": "3.0.2"
+    },
+    "openpyxl": {
+      "source": "pip",
+      "version": "3.1.5"
+    },
+    "numpy": {
+      "source": "pip",
+      "version": "2.4.4"
+    },
+    "xlrd": {
+      "source": "pip",
+      "version": "2.0.1"
+    }
+  },
+  "files": {
+    "app.py": {
+      "checksum": "1117feb4fe83a7da21e40e35d6746229"
+    },
+    "utils.py": {
+      "checksum": "162558141effe4231fbeaf43765c5e90"
+    },
+    "requirements.txt": {
+      "checksum": "c408c1c64f1fbaa24435c99adb7cd6c4"
+    },
+    "study_config.json": {
+      "checksum": "25455793658a844fa64c12e922a22881"
+    },
+    "runtime.txt": {
+      "checksum": "234aa39ae8ffa77eed43db0bd041e85e"
+    },
+    ".streamlit/config.toml": {
+      "checksum": "fb85eee94a2dca237c2f29ad28738393"
+    },
+    "pages/compare.py": {
+      "checksum": "a627311c357e0c901625a12130c93719"
+    },
+    "pages/extract.py": {
+      "checksum": "241a8885865bf7892b330e81833cc9d8"
+    }
+  }
+}

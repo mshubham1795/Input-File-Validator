@@ -1,0 +1,19 @@
+{
+  "_comment": "Paths can use environment variable STUDY_DATA_ROOT or be set via the app UI. On Posit Connect, configure STUDY_DATA_ROOT as an env var in the app settings.",
+  "AACQ-CPT": {
+    "template_path": "Z:\\qa\\ly3002813\\i5t_mc_aacq\\prelock\\data\\raw\\shared\\cpt3\\Template",
+    "output_path": "Z:\\qa\\ly3002813\\i5t_mc_aacq\\prelock\\data\\raw\\shared\\cpt3"
+  },
+  "GZQD-CPT": {
+    "template_path": "Z:\\qa\\ly3437943\\j1i_mc_gzqd\\prelock\\data\\raw\\shared\\input\\cpt\\Template",
+    "output_path": "Z:\\qa\\ly3437943\\j1i_mc_gzqd\\prelock\\data\\raw\\shared\\input\\cpt\\test"
+  },
+  "AACQ-METRICS": {
+    "template_path": "Z:\\qa\\ly3002813\\i5t_mc_aacq\\common\\SAS_Reports\\input\\metrics\\Template",
+    "output_path": "Z:\\qa\\ly3002813\\i5t_mc_aacq\\common\\SAS_Reports\\input\\metrics\\test"
+  },
+  "GZMP-CPT": {
+    "template_path": "Z:\\qa\\ly3537031\\j2s_mc_gzmp\\diva\\data\\raw\\shared\\input\\cpt\\Template",
+    "output_path": "Z:\\qa\\ly3537031\\j2s_mc_gzmp\\diva\\data\\raw\\shared\\input\\cpt\\Test"
+  }
+}

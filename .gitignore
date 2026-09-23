@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Posit Connect
+rsconnect-python/
+.rsconnect/
+
+# Test/sample data
+pages/J2S-MC-GZMP_Query_Detail.xlsx
+pages/J2S-MC-GZMP_Query_Detail_2026_08_03_00_33_EDT.csv
+
+# Dev tools & backup (entire directory)
+tools/
+
+# Windows launcher (not needed on server)
+Run_App.bat
+create_shortcut.py
+
+# Empty directories
+files/
