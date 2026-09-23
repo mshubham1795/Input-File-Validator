@@ -3596,9 +3596,11 @@ with st.container(border=True):
         )
         if uploaded_src:
             upload_dir = save_uploaded_files(uploaded_src)
-            st.session_state["cmp_src_input"] = upload_dir
-            st.session_state["cmp_trigger_scan"] = True
-            st.session_state.cmp_done = False
+            if st.session_state.get("cmp_src_input") != upload_dir:
+                st.session_state["cmp_src_input"] = upload_dir
+                st.session_state["cmp_trigger_scan"] = True
+                st.session_state.cmp_done = False
+                st.rerun()
             src_folder = upload_dir
 
     if st.session_state.pop("cmp_trigger_scan", False) and src_folder:
