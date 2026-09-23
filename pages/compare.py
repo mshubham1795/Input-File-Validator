@@ -3583,9 +3583,16 @@ with st.container(border=True):
                 st.session_state.pop("cmp_place_result", None)
                 st.rerun()
 
+    # --- Server fallback: file uploader for source files ---
+    # Apply any pending upload path BEFORE the text_input widget renders,
+    # so session_state is set while the key is still unbound.
+    _pending_upload_dir = None
+    if IS_SERVER:
+        if st.session_state.get("_cmp_pending_src_dir"):
+            st.session_state["cmp_src_input"] = st.session_state.pop("_cmp_pending_src_dir")
+
     src_folder = st.text_input("Source folder path", placeholder=r"e.g., Z:\qa\study\data\raw\shared\input\cpt", key="cmp_src_input")
 
-    # --- Server fallback: file uploader for source files ---
     if IS_SERVER:
         st.info("💡 Enter a network path accessible from the server, **or** upload files directly below.")
         uploaded_src = st.file_uploader(
@@ -3596,8 +3603,8 @@ with st.container(border=True):
         )
         if uploaded_src:
             upload_dir = save_uploaded_files(uploaded_src)
-            if st.session_state.get("cmp_src_input") != upload_dir:
-                st.session_state["cmp_src_input"] = upload_dir
+            if src_folder != upload_dir:
+                st.session_state["_cmp_pending_src_dir"] = upload_dir
                 st.session_state["cmp_trigger_scan"] = True
                 st.session_state.cmp_done = False
                 st.rerun()
