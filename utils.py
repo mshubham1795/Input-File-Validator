@@ -38,18 +38,25 @@ def _cleanup_upload_dir(dir_path: str) -> None:
 
 def _purge_stale_upload_dirs(max_age_seconds: int = 3600) -> None:
     """Remove ifv_upload_* directories older than *max_age_seconds* from the
-    system temp folder.  Catches orphans left by crashed sessions."""
+    system temp folder.  Catches orphans left by crashed sessions.
+    Limits scanning to avoid blocking on large /tmp directories."""
     import tempfile
     import time
     tmp_root = tempfile.gettempdir()
     now = time.time()
+    purged = 0
     try:
         for entry in os.scandir(tmp_root):
-            if entry.is_dir() and entry.name.startswith("ifv_upload_"):
+            if not entry.name.startswith("ifv_upload_"):
+                continue
+            if entry.is_dir():
                 try:
                     age = now - entry.stat().st_mtime
                     if age > max_age_seconds:
                         _cleanup_upload_dir(entry.path)
+                        purged += 1
+                        if purged >= 20:  # cap to avoid long scans
+                            break
                 except Exception:
                     pass
     except Exception:
@@ -60,23 +67,40 @@ def _purge_stale_upload_dirs(max_age_seconds: int = 3600) -> None:
 _active_upload_dirs: list[str] = []
 
 
+def _upload_fingerprint(uploaded_files) -> str:
+    """Build a fingerprint from file names and sizes to detect changes."""
+    parts = sorted(f"{uf.name}:{uf.size}" for uf in uploaded_files)
+    return "|".join(parts)
+
+
 def save_uploaded_files(uploaded_files) -> str:
     """Save Streamlit UploadedFile objects to a temp directory.
 
     Returns the absolute path of the temp directory so downstream code
     (scan_folder, openpyxl reads, etc.) can work with normal file paths.
 
-    Automatically cleans up the previous upload directory (if any) and
-    purges stale ifv_upload_* directories older than 1 hour.
+    Skips re-saving if the same set of files was already saved (detected
+    via a name+size fingerprint), making Streamlit reruns instant.
+    Automatically cleans up old upload directories.
     """
     import atexit
     import tempfile
+
+    # Fast path: if we already saved exactly these files, return the
+    # existing directory without touching disk.
+    fp = _upload_fingerprint(uploaded_files)
+    cached = st.session_state.get("_ifv_upload_cache")
+    if cached and cached.get("fp") == fp:
+        cached_dir = cached["dir"]
+        if os.path.isdir(cached_dir):
+            return cached_dir
 
     # 1. Remove any previous upload dir from this process
     while _active_upload_dirs:
         _cleanup_upload_dir(_active_upload_dirs.pop())
 
-    # 2. Purge stale upload dirs left by other/crashed sessions
+    # 2. Purge stale upload dirs left by other/crashed sessions (background,
+    #    limited to avoid blocking on large /tmp directories).
     _purge_stale_upload_dirs()
 
     # 3. Create a fresh temp directory and save the files
@@ -89,6 +113,9 @@ def save_uploaded_files(uploaded_files) -> str:
     # 4. Track it for cleanup on next upload or process exit
     _active_upload_dirs.append(upload_dir)
     atexit.register(_cleanup_upload_dir, upload_dir)
+
+    # 5. Cache the fingerprint so reruns skip the disk write
+    st.session_state["_ifv_upload_cache"] = {"fp": fp, "dir": upload_dir}
 
     return upload_dir
 
