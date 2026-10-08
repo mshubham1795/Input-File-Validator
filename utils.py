@@ -22,8 +22,8 @@ def is_server_environment() -> bool:
 
 IS_SERVER = is_server_environment()
 
-# Root path for the server-side folder browser (configurable via env var).
-SERVER_BROWSE_ROOT = os.environ.get("IFV_BROWSE_ROOT", "/lillyce/")
+# Default starting directory for the server-side folder browser.
+SERVER_BROWSE_START = os.environ.get("IFV_BROWSE_START", "/lillyce/")
 
 
 def _cleanup_upload_dir(dir_path: str) -> None:
@@ -118,7 +118,7 @@ def _list_subdirectories(path: str) -> tuple[list[str], str | None]:
 
 @st.dialog("Browse Server Folder", width="large")
 def server_folder_browser(browser_id: str, target_keys: list[str],
-                          root: str | None = None) -> None:
+                          start_dir: str | None = None) -> None:
     """Modal dialog that lets users navigate the server filesystem.
 
     Parameters
@@ -127,55 +127,54 @@ def server_folder_browser(browser_id: str, target_keys: list[str],
         Unique id for this browser instance (namespaces session-state keys).
     target_keys : list[str]
         Session-state keys to set when the user confirms a selection.
-    root : str, optional
-        Root path the user cannot navigate above.  Defaults to
-        ``SERVER_BROWSE_ROOT``.
+    start_dir : str, optional
+        Initial directory to show.  Defaults to ``SERVER_BROWSE_START``.
+        Falls back to ``/`` if the path is not accessible.
     """
-    if root is None:
-        root = SERVER_BROWSE_ROOT
-    # Normalise root to always end with /
-    root = root.rstrip("/") + "/"
+    if start_dir is None:
+        start_dir = SERVER_BROWSE_START
 
     cwd_key = f"_fb_{browser_id}_cwd"
     nav_key = f"_fb_{browser_id}_nav"  # manual path input
 
-    # Initialise current directory
+    # Initialise current directory (fall back to / if start_dir not readable)
     if cwd_key not in st.session_state:
-        st.session_state[cwd_key] = root
+        if os.path.isdir(start_dir):
+            st.session_state[cwd_key] = start_dir.rstrip("/") + "/"
+        else:
+            st.session_state[cwd_key] = "/"
 
     cwd = st.session_state[cwd_key]
 
     # --- Breadcrumb navigation ---
-    # Build segments relative to root
-    rel = os.path.relpath(cwd, root)
-    segments = [] if rel == "." else rel.replace("\\", "/").split("/")
-
-    crumb_parts = [root] + segments
+    parts = [p for p in cwd.split("/") if p]
     crumb_md = "📂  "
-    for i, part in enumerate(crumb_parts):
-        if i == 0:
-            crumb_md += f"`{root}`"
-        else:
-            crumb_md += f" › `{part}/`"
+    crumb_md += "`/`"
+    for part in parts:
+        crumb_md += f" › `{part}`"
     st.markdown(crumb_md)
 
     # Breadcrumb buttons (clickable to jump to any level)
-    if len(crumb_parts) > 1:
-        cols = st.columns(min(len(crumb_parts), 8))
-        for i, part in enumerate(crumb_parts):
-            with cols[i % len(cols)]:
-                label = part if i == 0 else f"{part}/"
-                if st.button(label, key=f"_fb_{browser_id}_crumb_{i}",
+    n_crumbs = 1 + len(parts)  # root + segments
+    if n_crumbs > 1:
+        cols = st.columns(min(n_crumbs, 8))
+        # Root button
+        with cols[0]:
+            if st.button("/", key=f"_fb_{browser_id}_crumb_0",
+                         use_container_width=True):
+                st.session_state[cwd_key] = "/"
+                st.rerun()
+        for i, part in enumerate(parts):
+            with cols[(i + 1) % len(cols)]:
+                if st.button(f"{part}/", key=f"_fb_{browser_id}_crumb_{i+1}",
                              use_container_width=True):
-                    if i == 0:
-                        st.session_state[cwd_key] = root
-                    else:
-                        st.session_state[cwd_key] = root + "/".join(segments[:i]) + "/"
+                    st.session_state[cwd_key] = "/" + "/".join(parts[:i+1]) + "/"
                     st.rerun()
 
     st.divider()
 
     # --- Manual path input ---
+    st.caption("Type or paste a path and click **Go** to navigate directly:")
     path_col, go_col = st.columns([5, 1])
     with path_col:
         manual_path = st.text_input(
@@ -187,25 +186,22 @@ def server_folder_browser(browser_id: str, target_keys: list[str],
 
     if go_clicked and manual_path:
         normalised = manual_path.rstrip("/") + "/"
-        if not normalised.startswith(root):
-            st.error(f"Path must be under `{root}`")
-        elif not os.path.isdir(manual_path):
+        if not os.path.isdir(manual_path):
             st.error("Path does not exist.")
         else:
             st.session_state[cwd_key] = normalised
             st.rerun()
 
     # --- Parent folder button ---
-    normalised_cwd = cwd.rstrip("/") + "/"
-    if normalised_cwd != root:
+    if cwd.rstrip("/") != "":
         if st.button("⬆  Parent folder", key=f"_fb_{browser_id}_up",
                      use_container_width=True):
             parent = os.path.dirname(cwd.rstrip("/"))
-            parent = parent.rstrip("/") + "/"
-            if parent.startswith(root):
-                st.session_state[cwd_key] = parent
+            if not parent:
+                parent = "/"
             else:
-                st.session_state[cwd_key] = root
+                parent = parent.rstrip("/") + "/"
+            st.session_state[cwd_key] = parent
             st.rerun()
 
     # --- Directory listing ---
@@ -214,6 +210,7 @@ def server_folder_browser(browser_id: str, target_keys: list[str],
 
     if error:
         st.warning(error)
+        st.info("💡 **Tip:** Type a full path above and click **Go** to navigate directly to an accessible folder.")
     elif not dirs:
         st.info("This folder contains no subdirectories.")
     else:

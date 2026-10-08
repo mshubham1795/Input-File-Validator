@@ -71,19 +71,8 @@ with st.container(border=True):
                     st.session_state["ext_folder_input"] = selected
                     st.session_state["ext_trigger_scan"] = True
                     st.rerun()
-        else:
-            if st.button("📂 Browse server folder", key="ext_browse_src_server"):
-                st.session_state["_fb_ext_src_open"] = True
-                st.rerun()
     with col_scan:
         scan_clicked = st.button("Scan folder", key="ext_scan_btn")
-
-    # Server folder browser dialog
-    if st.session_state.get("_fb_ext_src_open"):
-        server_folder_browser("ext_src", target_keys=["ext_folder_input"])
-        # If the dialog just set a folder, trigger scan
-        if not st.session_state.get("_fb_ext_src_open"):
-            st.session_state["ext_trigger_scan"] = True
 
     folder_path = st.text_input(
         "Folder path containing Excel files",
@@ -91,11 +80,11 @@ with st.container(border=True):
         key="ext_folder_input",
     )
 
-    # --- Server fallback: file uploader ---
+    # --- Server mode: file uploader for source files (local desktop → server) ---
     if IS_SERVER:
-        st.info("💡 Browse the server filesystem, enter a network path, **or** upload files directly below.")
+        st.info("💡 Select files from your computer below. They will be uploaded for processing.")
         uploaded_src_files = st.file_uploader(
-            "Upload Excel/CSV files",
+            "Browse files from your computer",
             type=["xlsx", "xls", "csv"],
             accept_multiple_files=True,
             key="ext_upload_src",

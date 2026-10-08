@@ -3582,25 +3582,8 @@ with st.container(border=True):
                 st.session_state["cmp_rename_map"] = {}
                 st.session_state.pop("cmp_place_result", None)
                 st.rerun()
-    else:
-        if st.button("📂 Browse server folder", key="cmp_browse_src_server"):
-            st.session_state["_fb_cmp_src_open"] = True
-            st.rerun()
 
-    # Server folder browser dialog for source
-    if st.session_state.get("_fb_cmp_src_open"):
-        server_folder_browser("cmp_src", target_keys=["cmp_src_input"])
-        # If the dialog just set a folder, trigger scan and reset state
-        if not st.session_state.get("_fb_cmp_src_open"):
-            st.session_state["cmp_trigger_scan"] = True
-            st.session_state.cmp_done = False
-            st.session_state.cmp_findings = []
-            st.session_state.cmp_fixed = False
-            st.session_state["cmp_placed_done"] = False
-            st.session_state["cmp_rename_map"] = {}
-            st.session_state.pop("cmp_place_result", None)
-
-    # --- Server fallback: file uploader for source files ---
+    # --- Server mode: file uploader for source files (local desktop → server) ---
     # Apply any pending upload path BEFORE the text_input widget renders,
     # so session_state is set while the key is still unbound.
     _pending_upload_dir = None
@@ -3611,9 +3594,9 @@ with st.container(border=True):
     src_folder = st.text_input("Source folder path", placeholder=r"e.g., Z:\qa\study\data\raw\shared\input\cpt", key="cmp_src_input")
 
     if IS_SERVER:
-        st.info("💡 Browse the server filesystem, enter a network path, **or** upload files directly below.")
+        st.info("💡 Select source files from your computer below. They will be uploaded for processing.")
         uploaded_src = st.file_uploader(
-            "Upload source Excel/CSV files",
+            "Browse files from your computer",
             type=["xlsx", "xls", "csv"],
             accept_multiple_files=True,
             key="cmp_upload_src",
