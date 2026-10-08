@@ -1781,20 +1781,54 @@ def _deeper_analysis(findings, placed_path, template_path, placed_name,
                                  "is_csv": is_placed_csv},
                 })
             elif p_type == "date" and t_type == "date":
+                # Both sides detected as "date", but the PHYSICAL STORAGE may
+                # differ (text strings vs native Excel date serials).  Check
+                # storage first — a storage mismatch is a Data Type issue, not
+                # merely a format issue.
+                p_fmt = p_info["format"]
+                t_fmt = t_info["format"]
+
+                tpl_col_actual = tpl_col_idx_by_name.get(t_name, col_i)
+
+                # Classify physical storage (text_date / native_date / mixed / unknown)
+                p_storage = _classify_date_cell_storage(
+                    placed_path, placed_sheet, placed_hdr_row, col_i, is_placed_csv)
+                t_storage = _classify_date_cell_storage(
+                    template_path, template_sheet, tpl_hdr_row, tpl_col_actual, is_template_csv)
+
+                # Storage mismatch → report as Data Type issue
+                if (p_storage in ("text_date", "native_date") and
+                    t_storage in ("text_date", "native_date") and
+                    p_storage != t_storage):
+                    p_label = "Character (text)" if p_storage == "text_date" else "Numeric (native date)"
+                    t_label = "Character (text)" if t_storage == "text_date" else "Numeric (native date)"
+                    findings.append({
+                        "File": placed_name, "Check": f"Data Type ({p_info['header']})",
+                        "Placed Value": f"date ({p_label})",
+                        "Template Value": f"date ({t_label})",
+                        "fix_type": "fix_data_type",
+                        "fix_data": {"sheet": placed_sheet, "col_idx": col_i, "hdr_row": placed_hdr_row,
+                                     "from_type": "date", "to_type": "date", "target_format": t_fmt,
+                                     "source_format": p_fmt,
+                                     "template_path": template_path, "tpl_col_idx": tpl_col_actual,
+                                     "tpl_hdr_row": tpl_hdr_row,
+                                     "is_csv": is_placed_csv,
+                                     "date_classification": "data_type_storage_mismatch",
+                                     "placed_storage": p_storage,
+                                     "template_storage": t_storage},
+                    })
+                    continue
+
+                # Skip legacy/unknown format labels
+                if p_fmt == "text-date" or t_fmt == "text-date":
+                    continue
+
                 # Date format comparison using CANONICAL SIGNATURES.
                 # A date column is a real mismatch ONLY when the structural
                 # FORMAT differs (component order + delimiter). Actual cell
                 # VALUES are never compared: the template is a structural
                 # reference and holds different data, so row-by-row comparison
                 # would always produce false positives.
-                p_fmt = p_info["format"]
-                t_fmt = t_info["format"]
-
-                # Skip legacy/unknown format labels
-                if p_fmt == "text-date" or t_fmt == "text-date":
-                    continue
-
-                tpl_col_actual = tpl_col_idx_by_name.get(t_name, col_i)
 
                 # --- Canonical signature comparison ---
                 # Derives structural fingerprint: component order + delimiter.
@@ -1808,8 +1842,6 @@ def _deeper_analysis(findings, placed_path, template_path, placed_name,
 
                 # Real format mismatch found — flag it
                 check_label = f"Date Format ({p_info['header']})"
-                p_storage = "text_date" if is_placed_csv else "native_date"
-                t_storage = "text_date" if is_template_csv else "native_date"
 
                 findings.append({
                     "File": placed_name, "Check": check_label,
