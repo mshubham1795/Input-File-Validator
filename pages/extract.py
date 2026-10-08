@@ -12,6 +12,7 @@ from utils import (
     browse_folder, scan_folder, get_sheet_names_fast, find_header_row,
     find_subject_column, find_status_column, classify_filename,
     convert_path_to_unix, IS_SERVER, save_uploaded_files,
+    server_folder_browser,
 )
 
 st.title("CPT metadata")
@@ -70,8 +71,19 @@ with st.container(border=True):
                     st.session_state["ext_folder_input"] = selected
                     st.session_state["ext_trigger_scan"] = True
                     st.rerun()
+        else:
+            if st.button("📂 Browse server folder", key="ext_browse_src_server"):
+                st.session_state["_fb_ext_src_open"] = True
+                st.rerun()
     with col_scan:
         scan_clicked = st.button("Scan folder", key="ext_scan_btn")
+
+    # Server folder browser dialog
+    if st.session_state.get("_fb_ext_src_open"):
+        server_folder_browser("ext_src", target_keys=["ext_folder_input"])
+        # If the dialog just set a folder, trigger scan
+        if not st.session_state.get("_fb_ext_src_open"):
+            st.session_state["ext_trigger_scan"] = True
 
     folder_path = st.text_input(
         "Folder path containing Excel files",
@@ -81,7 +93,7 @@ with st.container(border=True):
 
     # --- Server fallback: file uploader ---
     if IS_SERVER:
-        st.info("💡 Enter a network path accessible from the server, **or** upload files directly below.")
+        st.info("💡 Browse the server filesystem, enter a network path, **or** upload files directly below.")
         uploaded_src_files = st.file_uploader(
             "Upload Excel/CSV files",
             type=["xlsx", "xls", "csv"],
@@ -203,6 +215,14 @@ if st.session_state.ext_excel_files:
                     if selected_out:
                         st.session_state["ext_output_path"] = selected_out
                         st.rerun()
+            else:
+                if st.button("📂 Browse server folder", key="ext_browse_out_server"):
+                    st.session_state["_fb_ext_out_open"] = True
+                    st.rerun()
+
+            # Server folder browser dialog for output
+            if st.session_state.get("_fb_ext_out_open"):
+                server_folder_browser("ext_out", target_keys=["ext_output_path"])
 
             output_path = st.text_input(
                 "Output folder path",

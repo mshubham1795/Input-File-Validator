@@ -25,7 +25,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from utils import (
     browse_folder, scan_folder, get_sheet_names_fast, find_header_row,
     find_subject_column, find_status_column, get_file_category, FILENAME_RULES,
-    IS_SERVER, save_uploaded_files,
+    IS_SERVER, save_uploaded_files, server_folder_browser,
 )
 
 # --- Shared date format constants ---
@@ -3582,6 +3582,23 @@ with st.container(border=True):
                 st.session_state["cmp_rename_map"] = {}
                 st.session_state.pop("cmp_place_result", None)
                 st.rerun()
+    else:
+        if st.button("📂 Browse server folder", key="cmp_browse_src_server"):
+            st.session_state["_fb_cmp_src_open"] = True
+            st.rerun()
+
+    # Server folder browser dialog for source
+    if st.session_state.get("_fb_cmp_src_open"):
+        server_folder_browser("cmp_src", target_keys=["cmp_src_input"])
+        # If the dialog just set a folder, trigger scan and reset state
+        if not st.session_state.get("_fb_cmp_src_open"):
+            st.session_state["cmp_trigger_scan"] = True
+            st.session_state.cmp_done = False
+            st.session_state.cmp_findings = []
+            st.session_state.cmp_fixed = False
+            st.session_state["cmp_placed_done"] = False
+            st.session_state["cmp_rename_map"] = {}
+            st.session_state.pop("cmp_place_result", None)
 
     # --- Server fallback: file uploader for source files ---
     # Apply any pending upload path BEFORE the text_input widget renders,
@@ -3594,7 +3611,7 @@ with st.container(border=True):
     src_folder = st.text_input("Source folder path", placeholder=r"e.g., Z:\qa\study\data\raw\shared\input\cpt", key="cmp_src_input")
 
     if IS_SERVER:
-        st.info("💡 Enter a network path accessible from the server, **or** upload files directly below.")
+        st.info("💡 Browse the server filesystem, enter a network path, **or** upload files directly below.")
         uploaded_src = st.file_uploader(
             "Upload source Excel/CSV files",
             type=["xlsx", "xls", "csv"],
@@ -3737,7 +3754,7 @@ if st.session_state.get("cmp_done") and st.session_state.get("cmp_selected"):
                 st.rerun()
 
         else:
-            # New study — browse button only (hidden on server)
+            # New study — browse button
             if not IS_SERVER:
                 if st.button("Browse folder (template & output)", key="cmp_browse_folder"):
                     sel = browse_folder()
@@ -3747,6 +3764,17 @@ if st.session_state.get("cmp_done") and st.session_state.get("cmp_selected"):
                         st.session_state.cmp_findings = []
                         st.session_state.cmp_fixed = False
                         st.rerun()
+            else:
+                if st.button("📂 Browse server folder (template & output)", key="cmp_browse_folder_server"):
+                    st.session_state["_fb_cmp_tpl_out_open"] = True
+                    st.rerun()
+
+            # Server folder browser dialog for template+output
+            if st.session_state.get("_fb_cmp_tpl_out_open"):
+                server_folder_browser("cmp_tpl_out", target_keys=["cmp_tpl_input", "cmp_out_input"])
+                if not st.session_state.get("_fb_cmp_tpl_out_open"):
+                    st.session_state.cmp_findings = []
+                    st.session_state.cmp_fixed = False
 
             _path_col2, _ = st.columns([2, 1])
             with _path_col2:
@@ -3766,6 +3794,15 @@ if st.session_state.get("cmp_done") and st.session_state.get("cmp_selected"):
                         if sel:
                             st.session_state["cmp_out_input"] = sel
                             st.rerun()
+                else:
+                    if st.button("📂 Browse server folder", key="cmp_browse_out_server"):
+                        st.session_state["_fb_cmp_out_open"] = True
+                        st.rerun()
+
+                # Server folder browser dialog for output only
+                if st.session_state.get("_fb_cmp_out_open"):
+                    server_folder_browser("cmp_out", target_keys=["cmp_out_input"])
+
                 st.text_input("Output folder (if different)", key="cmp_out_input")
 
             # Save & Compare button

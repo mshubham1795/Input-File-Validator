@@ -1,6 +1,7 @@
 """Shared utility functions for File Data Extractor."""
 import pandas as pd
 from pathlib import Path
+import streamlit as st
 import openpyxl
 import os
 import re
@@ -21,20 +22,233 @@ def is_server_environment() -> bool:
 
 IS_SERVER = is_server_environment()
 
+# Root path for the server-side folder browser (configurable via env var).
+SERVER_BROWSE_ROOT = os.environ.get("IFV_BROWSE_ROOT", "/lillyce/")
+
+
+def _cleanup_upload_dir(dir_path: str) -> None:
+    """Silently remove an ifv_upload_* temp directory."""
+    import shutil
+    try:
+        if dir_path and os.path.isdir(dir_path) and os.path.basename(dir_path).startswith("ifv_upload_"):
+            shutil.rmtree(dir_path, ignore_errors=True)
+    except Exception:
+        pass
+
+
+def _purge_stale_upload_dirs(max_age_seconds: int = 3600) -> None:
+    """Remove ifv_upload_* directories older than *max_age_seconds* from the
+    system temp folder.  Catches orphans left by crashed sessions."""
+    import tempfile
+    import time
+    tmp_root = tempfile.gettempdir()
+    now = time.time()
+    try:
+        for entry in os.scandir(tmp_root):
+            if entry.is_dir() and entry.name.startswith("ifv_upload_"):
+                try:
+                    age = now - entry.stat().st_mtime
+                    if age > max_age_seconds:
+                        _cleanup_upload_dir(entry.path)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+
+# Track the most-recently created upload dir so we can clean it up later.
+_active_upload_dirs: list[str] = []
+
 
 def save_uploaded_files(uploaded_files) -> str:
     """Save Streamlit UploadedFile objects to a temp directory.
 
     Returns the absolute path of the temp directory so downstream code
     (scan_folder, openpyxl reads, etc.) can work with normal file paths.
+
+    Automatically cleans up the previous upload directory (if any) and
+    purges stale ifv_upload_* directories older than 1 hour.
     """
+    import atexit
     import tempfile
+
+    # 1. Remove any previous upload dir from this process
+    while _active_upload_dirs:
+        _cleanup_upload_dir(_active_upload_dirs.pop())
+
+    # 2. Purge stale upload dirs left by other/crashed sessions
+    _purge_stale_upload_dirs()
+
+    # 3. Create a fresh temp directory and save the files
     upload_dir = tempfile.mkdtemp(prefix="ifv_upload_")
     for uf in uploaded_files:
         dest = os.path.join(upload_dir, uf.name)
         with open(dest, "wb") as f:
             f.write(uf.getbuffer())
+
+    # 4. Track it for cleanup on next upload or process exit
+    _active_upload_dirs.append(upload_dir)
+    atexit.register(_cleanup_upload_dir, upload_dir)
+
     return upload_dir
+
+
+# ---------------------------------------------------------------------------
+# Server-side folder browser (Posit Connect)
+# ---------------------------------------------------------------------------
+def _list_subdirectories(path: str) -> tuple[list[str], str | None]:
+    """Return (sorted list of subdirectory names, error_message or None)."""
+    try:
+        dirs = []
+        with os.scandir(path) as entries:
+            for entry in entries:
+                try:
+                    if entry.is_dir(follow_symlinks=True):
+                        dirs.append(entry.name)
+                except OSError:
+                    pass
+        return sorted(dirs, key=str.lower), None
+    except PermissionError:
+        return [], f"Permission denied: {path}"
+    except FileNotFoundError:
+        return [], f"Path not found: {path}"
+    except OSError as e:
+        return [], f"Cannot read directory: {e}"
+
+
+@st.dialog("Browse Server Folder", width="large")
+def server_folder_browser(browser_id: str, target_keys: list[str],
+                          root: str | None = None) -> None:
+    """Modal dialog that lets users navigate the server filesystem.
+
+    Parameters
+    ----------
+    browser_id : str
+        Unique id for this browser instance (namespaces session-state keys).
+    target_keys : list[str]
+        Session-state keys to set when the user confirms a selection.
+    root : str, optional
+        Root path the user cannot navigate above.  Defaults to
+        ``SERVER_BROWSE_ROOT``.
+    """
+    if root is None:
+        root = SERVER_BROWSE_ROOT
+    # Normalise root to always end with /
+    root = root.rstrip("/") + "/"
+
+    cwd_key = f"_fb_{browser_id}_cwd"
+    nav_key = f"_fb_{browser_id}_nav"  # manual path input
+
+    # Initialise current directory
+    if cwd_key not in st.session_state:
+        st.session_state[cwd_key] = root
+
+    cwd = st.session_state[cwd_key]
+
+    # --- Breadcrumb navigation ---
+    # Build segments relative to root
+    rel = os.path.relpath(cwd, root)
+    segments = [] if rel == "." else rel.replace("\\", "/").split("/")
+
+    crumb_parts = [root] + segments
+    crumb_md = "📂  "
+    for i, part in enumerate(crumb_parts):
+        if i == 0:
+            crumb_md += f"`{root}`"
+        else:
+            crumb_md += f" › `{part}/`"
+    st.markdown(crumb_md)
+
+    # Breadcrumb buttons (clickable to jump to any level)
+    if len(crumb_parts) > 1:
+        cols = st.columns(min(len(crumb_parts), 8))
+        for i, part in enumerate(crumb_parts):
+            with cols[i % len(cols)]:
+                label = part if i == 0 else f"{part}/"
+                if st.button(label, key=f"_fb_{browser_id}_crumb_{i}",
+                             use_container_width=True):
+                    if i == 0:
+                        st.session_state[cwd_key] = root
+                    else:
+                        st.session_state[cwd_key] = root + "/".join(segments[:i]) + "/"
+                    st.rerun()
+
+    st.divider()
+
+    # --- Manual path input ---
+    path_col, go_col = st.columns([5, 1])
+    with path_col:
+        manual_path = st.text_input(
+            "Path", value=cwd, key=nav_key, label_visibility="collapsed",
+        )
+    with go_col:
+        go_clicked = st.button("Go", key=f"_fb_{browser_id}_go",
+                               use_container_width=True)
+
+    if go_clicked and manual_path:
+        normalised = manual_path.rstrip("/") + "/"
+        if not normalised.startswith(root):
+            st.error(f"Path must be under `{root}`")
+        elif not os.path.isdir(manual_path):
+            st.error("Path does not exist.")
+        else:
+            st.session_state[cwd_key] = normalised
+            st.rerun()
+
+    # --- Parent folder button ---
+    normalised_cwd = cwd.rstrip("/") + "/"
+    if normalised_cwd != root:
+        if st.button("⬆  Parent folder", key=f"_fb_{browser_id}_up",
+                     use_container_width=True):
+            parent = os.path.dirname(cwd.rstrip("/"))
+            parent = parent.rstrip("/") + "/"
+            if parent.startswith(root):
+                st.session_state[cwd_key] = parent
+            else:
+                st.session_state[cwd_key] = root
+            st.rerun()
+
+    # --- Directory listing ---
+    with st.spinner("Loading directories…"):
+        dirs, error = _list_subdirectories(cwd)
+
+    if error:
+        st.warning(error)
+    elif not dirs:
+        st.info("This folder contains no subdirectories.")
+    else:
+        if len(dirs) > 200:
+            st.caption(f"Showing first 200 of {len(dirs)} subdirectories.")
+            dirs = dirs[:200]
+        # Render directory buttons in two columns for better use of space
+        col_a, col_b = st.columns(2)
+        for idx, d in enumerate(dirs):
+            with (col_a if idx % 2 == 0 else col_b):
+                if st.button(f"📁 {d}/", key=f"_fb_{browser_id}_d_{idx}",
+                             use_container_width=True):
+                    st.session_state[cwd_key] = os.path.join(cwd, d) + "/"
+                    st.rerun()
+
+    # --- Select / Cancel ---
+    st.divider()
+    sel_col, cancel_col = st.columns(2)
+    with sel_col:
+        if st.button("✅ Select this folder", type="primary",
+                     key=f"_fb_{browser_id}_select", use_container_width=True):
+            for tkey in target_keys:
+                st.session_state[tkey] = cwd.rstrip("/")
+            st.session_state[f"_fb_{browser_id}_open"] = False
+            # Clean up browser state
+            st.session_state.pop(cwd_key, None)
+            st.session_state.pop(nav_key, None)
+            st.rerun()
+    with cancel_col:
+        if st.button("Cancel", key=f"_fb_{browser_id}_cancel",
+                     use_container_width=True):
+            st.session_state[f"_fb_{browser_id}_open"] = False
+            st.session_state.pop(cwd_key, None)
+            st.session_state.pop(nav_key, None)
+            st.rerun()
 
 
 def browse_folder() -> str:
