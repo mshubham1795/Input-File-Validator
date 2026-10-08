@@ -25,6 +25,34 @@ IS_SERVER = is_server_environment()
 # Default starting directory for the server-side folder browser.
 SERVER_BROWSE_START = os.environ.get("IFV_BROWSE_START", "/lillyce/")
 
+# Mapping of Windows drive letters to server mount points.
+# Used to convert paths from study_config.json when running on the server.
+# Format: "DRIVE_LETTER:SERVER_PATH" (configurable via env var).
+_DRIVE_MAP_RAW = os.environ.get("IFV_DRIVE_MAP", "Z:/lillyce")
+DRIVE_TO_SERVER: dict[str, str] = {}
+for _entry in _DRIVE_MAP_RAW.split(";"):
+    _entry = _entry.strip()
+    if ":" in _entry:
+        _drive, _mount = _entry.split(":", 1)
+        DRIVE_TO_SERVER[_drive.upper()] = _mount.rstrip("/")
+
+
+def convert_windows_path_for_server(path: str) -> str:
+    """Convert a Windows path (e.g. Z:\\qa\\...) to a server path (/lillyce/qa/...).
+
+    Uses the DRIVE_TO_SERVER mapping.  Returns the path unchanged if no
+    mapping matches or if not running on the server.
+    """
+    if not IS_SERVER or not path:
+        return path
+    path_fwd = path.replace("\\", "/")
+    if len(path_fwd) >= 2 and path_fwd[1] == ":":
+        drive = path_fwd[0].upper()
+        mount = DRIVE_TO_SERVER.get(drive)
+        if mount:
+            return mount + path_fwd[2:]  # replace "Z:" with "/lillyce"
+    return path
+
 
 def _cleanup_upload_dir(dir_path: str) -> None:
     """Silently remove an ifv_upload_* temp directory."""

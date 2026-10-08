@@ -26,6 +26,7 @@ from utils import (
     browse_folder, scan_folder, get_sheet_names_fast, find_header_row,
     find_subject_column, find_status_column, get_file_category, FILENAME_RULES,
     IS_SERVER, save_uploaded_files, server_folder_browser,
+    convert_windows_path_for_server,
 )
 
 # --- Shared date format constants ---
@@ -3622,27 +3623,42 @@ with st.container(border=True):
 
     if st.session_state.cmp_excel_files:
         st.markdown("<div style='height:0.5rem;'></div>", unsafe_allow_html=True)
-        col_sa, col_da, _ = st.columns([1.2, 1.2, 4])
-        with col_sa:
-            if st.button("Select all", key="cmp_sel_all"):
-                for f in st.session_state.cmp_excel_files:
-                    st.session_state[f"cmp_chk_{f}"] = True
-                st.rerun()
-        with col_da:
-            if st.button("Deselect all", key="cmp_desel_all"):
-                for f in st.session_state.cmp_excel_files:
-                    st.session_state[f"cmp_chk_{f}"] = False
-                st.rerun()
 
-        st.markdown("<div style='height:0.8rem;'></div>", unsafe_allow_html=True)
+        # Detect if files came from the file uploader (server mode)
+        _from_upload = "ifv_upload_" in st.session_state.get("cmp_src_folder", "")
 
-        selected_files = []
-        _file_cols = st.columns(2)
-        for idx, f in enumerate(st.session_state.cmp_excel_files):
-            with _file_cols[idx % 2]:
-                _checked = st.checkbox(f, key=f"cmp_chk_{f}")
-                if _checked:
-                    selected_files.append(f)
+        if _from_upload:
+            # Auto-select all uploaded files — just show a confirmation list
+            selected_files = list(st.session_state.cmp_excel_files)
+            st.caption(f"**{len(selected_files)} files** selected for processing:")
+            _file_cols = st.columns(2)
+            for idx, f in enumerate(selected_files):
+                with _file_cols[idx % 2]:
+                    st.markdown(f"✅ {f}")
+        else:
+            # Desktop mode — show checkboxes for individual selection
+            col_sa, col_da, _ = st.columns([1.2, 1.2, 4])
+            with col_sa:
+                if st.button("Select all", key="cmp_sel_all"):
+                    for f in st.session_state.cmp_excel_files:
+                        st.session_state[f"cmp_chk_{f}"] = True
+                    st.rerun()
+            with col_da:
+                if st.button("Deselect all", key="cmp_desel_all"):
+                    for f in st.session_state.cmp_excel_files:
+                        st.session_state[f"cmp_chk_{f}"] = False
+                    st.rerun()
+
+            st.markdown("<div style='height:0.8rem;'></div>", unsafe_allow_html=True)
+
+            selected_files = []
+            _file_cols = st.columns(2)
+            for idx, f in enumerate(st.session_state.cmp_excel_files):
+                with _file_cols[idx % 2]:
+                    _checked = st.checkbox(f, key=f"cmp_chk_{f}")
+                    if _checked:
+                        selected_files.append(f)
+
         # Only update cmp_selected from checkboxes BEFORE comparison is done.
         # After cmp_done, the list may have been updated by Fix All (renames).
         if not st.session_state.get("cmp_done"):
@@ -3656,8 +3672,10 @@ with st.container(border=True):
                 st.session_state.cmp_done = True
                 config = load_study_config()
                 if study and study in config:
-                    st.session_state["cmp_tpl_input"] = config[study].get("template_path", "")
-                    st.session_state["cmp_out_input"] = config[study].get("output_path", "")
+                    tpl = config[study].get("template_path", "")
+                    out = config[study].get("output_path", "")
+                    st.session_state["cmp_tpl_input"] = convert_windows_path_for_server(tpl)
+                    st.session_state["cmp_out_input"] = convert_windows_path_for_server(out)
                 st.rerun()
 
 
@@ -3703,8 +3721,8 @@ if st.session_state.get("cmp_done") and st.session_state.get("cmp_selected"):
         if not is_new_study:
             # Existing study — auto-fill, no browse needed
             study_data = config[selected_option]
-            folder_path = study_data.get("template_path", "")
-            out_path = study_data.get("output_path", "") or folder_path
+            folder_path = convert_windows_path_for_server(study_data.get("template_path", ""))
+            out_path = convert_windows_path_for_server(study_data.get("output_path", "")) or folder_path
 
             # Always set paths from config — this is the source of truth for the selected study
             st.session_state["cmp_tpl_input"] = folder_path
