@@ -3007,8 +3007,11 @@ def apply_fixes(findings, output_folder):
                                 src_fmt = fix_data.get("source_format", "")
                                 _vectorized_date_reformat(df, col_name, src_fmt, py_fmt)
                                 # Convert reformatted strings to datetime for native Excel date storage
+                                # Use the PARSE format (strptime-compatible, no %# Windows codes)
+                                # because pd.to_datetime uses strptime, not strftime.
+                                parse_fmt = _VECTORIZED_PARSE_FORMATS.get(target_fmt, "%Y-%m-%d")
                                 try:
-                                    df[col_name] = pd.to_datetime(df[col_name], format=py_fmt, errors="coerce")
+                                    df[col_name] = pd.to_datetime(df[col_name], format=parse_fmt, errors="coerce")
                                     _date_fmt_map[col_name] = _DATE_FMT_LABEL_TO_EXCEL.get(target_fmt, "yyyy-mm-dd")
                                 except Exception:
                                     pass  # Leave as string if conversion fails
@@ -3019,8 +3022,10 @@ def apply_fixes(findings, output_folder):
                                 src_fmt = fix_data.get("source_format", "")
                                 _vectorized_date_reformat(df, col_name, src_fmt, target_py_fmt)
                                 # Convert to datetime for native Excel date storage
+                                # Use the PARSE format (strptime-compatible, no %# Windows codes)
+                                parse_fmt = _VECTORIZED_PARSE_FORMATS.get(target_fmt, "%Y-%m-%d")
                                 try:
-                                    df[col_name] = pd.to_datetime(df[col_name], format=target_py_fmt, errors="coerce")
+                                    df[col_name] = pd.to_datetime(df[col_name], format=parse_fmt, errors="coerce")
                                     _date_fmt_map[col_name] = _DATE_FMT_LABEL_TO_EXCEL.get(target_fmt, "yyyy-mm-dd")
                                 except Exception:
                                     pass
