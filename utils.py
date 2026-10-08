@@ -23,7 +23,7 @@ def is_server_environment() -> bool:
 IS_SERVER = is_server_environment()
 
 # Default starting directory for the server-side folder browser.
-SERVER_BROWSE_START = os.environ.get("IFV_BROWSE_START", "/lillyce/")
+SERVER_BROWSE_START = os.environ.get("IFV_BROWSE_START", "/lillyce/qa/")
 
 # Mapping of Windows drive letters to server mount points.
 # Used to convert paths from study_config.json when running on the server.
