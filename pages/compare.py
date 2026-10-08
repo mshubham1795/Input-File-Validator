@@ -1802,13 +1802,23 @@ def _deeper_analysis(findings, placed_path, template_path, placed_name,
                     p_storage != t_storage):
                     p_label = "Character (text)" if p_storage == "text_date" else "Numeric (native date)"
                     t_label = "Character (text)" if t_storage == "text_date" else "Numeric (native date)"
+                    # For the output format, prefer the text side's format (accurately
+                    # detected from actual values via regex) over the native side's
+                    # format which may be a "YYYY-MM-DD" fallback when the Excel
+                    # number_format is "General".
+                    if p_storage == "text_date" and p_fmt and p_fmt != "YYYY-MM-DD":
+                        effective_target_fmt = p_fmt
+                    elif t_storage == "text_date" and t_fmt and t_fmt != "YYYY-MM-DD":
+                        effective_target_fmt = t_fmt
+                    else:
+                        effective_target_fmt = t_fmt
                     findings.append({
                         "File": placed_name, "Check": f"Data Type ({p_info['header']})",
                         "Placed Value": f"date ({p_label})",
                         "Template Value": f"date ({t_label})",
                         "fix_type": "fix_data_type",
                         "fix_data": {"sheet": placed_sheet, "col_idx": col_i, "hdr_row": placed_hdr_row,
-                                     "from_type": "date", "to_type": "date", "target_format": t_fmt,
+                                     "from_type": "date", "to_type": "date", "target_format": effective_target_fmt,
                                      "source_format": p_fmt,
                                      "template_path": template_path, "tpl_col_idx": tpl_col_actual,
                                      "tpl_hdr_row": tpl_hdr_row,
