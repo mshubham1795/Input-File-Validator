@@ -3752,6 +3752,10 @@ if st.session_state.get("cmp_done") and st.session_state.get("cmp_selected"):
     with st.container(border=True):
         st.markdown("<h3 style='margin-top:0;'>🔄 Study, Paths & Compare</h3>", unsafe_allow_html=True)
 
+        # Clean up any stale dialog flags from prior interactions
+        for _stale_key in [k for k in st.session_state if k.startswith("_fb_") and k.endswith("_open")]:
+            st.session_state.pop(_stale_key, None)
+
         config = load_study_config()
         detected_study = st.session_state.get("cmp_study_name", "")
 
@@ -3843,16 +3847,9 @@ if st.session_state.get("cmp_done") and st.session_state.get("cmp_selected"):
                             st.session_state.cmp_fixed = False
                             st.rerun()
                 else:
+                    # One-shot trigger: set on click, consumed immediately
                     if st.button("📂 Browse server", key="cmp_browse_folder_server", use_container_width=True):
-                        st.session_state["_fb_cmp_tpl_out_open"] = True
-                        st.rerun()
-
-            # Server folder browser dialog for template+output
-            if st.session_state.get("_fb_cmp_tpl_out_open"):
-                server_folder_browser("cmp_tpl_out", target_keys=["cmp_tpl_input", "cmp_out_input"])
-                if not st.session_state.get("_fb_cmp_tpl_out_open"):
-                    st.session_state.cmp_findings = []
-                    st.session_state.cmp_fixed = False
+                        server_folder_browser("cmp_tpl_out", target_keys=["cmp_tpl_input", "cmp_out_input"])
 
             if main_folder and not st.session_state.get("cmp_out_input"):
                 st.session_state["cmp_out_input"] = main_folder
@@ -3876,12 +3873,7 @@ if st.session_state.get("cmp_done") and st.session_state.get("cmp_selected"):
                                 st.rerun()
                     else:
                         if st.button("📂 Browse server", key="cmp_browse_out_server", use_container_width=True):
-                            st.session_state["_fb_cmp_out_open"] = True
-                            st.rerun()
-
-                # Server folder browser dialog for output only
-                if st.session_state.get("_fb_cmp_out_open"):
-                    server_folder_browser("cmp_out", target_keys=["cmp_out_input"])
+                            server_folder_browser("cmp_out", target_keys=["cmp_out_input"])
 
             # Save & Compare button
             if main_folder:
