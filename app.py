@@ -23,6 +23,14 @@ st.markdown("""
         font-family: 'Plus Jakarta Sans', sans-serif !important;
     }
 
+    /* Hide Streamlit's auto-generated page navigation completely */
+    [data-testid="stSidebarNav"],
+    [data-testid="stSidebarNavItems"] {
+        display: none !important;
+        height: 0 !important;
+        overflow: hidden !important;
+    }
+
     /* ===== SIDEBAR ===== */
     [data-testid="stSidebar"] {
         background: #0B0F17;

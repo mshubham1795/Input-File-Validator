@@ -3823,13 +3823,13 @@ if st.session_state.get("cmp_done") and st.session_state.get("cmp_selected"):
 
         else:
             # New study — manual path entry + optional browse
+            st.caption("💡 Type or paste your network path below (e.g. `Z:\\qa\\...`). Windows paths are auto-converted for the server.")
             _tpl_path_col, _tpl_browse_col = st.columns([5, 1.5])
             with _tpl_path_col:
                 main_folder = st.text_input(
                     "Folder path (used for comparison & placing)",
                     placeholder=r"e.g., Z:\qa\study\data\raw\shared\input\cpt\Template",
                     key="cmp_tpl_input",
-                    help="Type or paste a network-mapped path directly, or use Browse to navigate.",
                 )
             with _tpl_browse_col:
                 st.markdown("<div style='height:1.62rem;'></div>", unsafe_allow_html=True)
@@ -3843,7 +3843,7 @@ if st.session_state.get("cmp_done") and st.session_state.get("cmp_selected"):
                             st.session_state.cmp_fixed = False
                             st.rerun()
                 else:
-                    if st.button("📂 Browse", key="cmp_browse_folder_server", use_container_width=True):
+                    if st.button("📂 Browse server", key="cmp_browse_folder_server", use_container_width=True):
                         st.session_state["_fb_cmp_tpl_out_open"] = True
                         st.rerun()
 
@@ -3865,7 +3865,6 @@ if st.session_state.get("cmp_done") and st.session_state.get("cmp_selected"):
                         "Output folder (if different)",
                         key="cmp_out_input",
                         placeholder=r"e.g., Z:\qa\study\data\raw\shared\input\metrics\Template",
-                        help="Type or paste a path directly, or use Browse to navigate.",
                     )
                 with _out_browse_col:
                     st.markdown("<div style='height:1.62rem;'></div>", unsafe_allow_html=True)
@@ -3876,7 +3875,7 @@ if st.session_state.get("cmp_done") and st.session_state.get("cmp_selected"):
                                 st.session_state["cmp_out_input"] = sel
                                 st.rerun()
                     else:
-                        if st.button("📂 Browse", key="cmp_browse_out_server", use_container_width=True):
+                        if st.button("📂 Browse server", key="cmp_browse_out_server", use_container_width=True):
                             st.session_state["_fb_cmp_out_open"] = True
                             st.rerun()
 
@@ -3915,7 +3914,7 @@ if st.session_state.get("cmp_done") and st.session_state.get("cmp_selected"):
         _detect_csv_column_types.cache_clear()
         get_data_sheet.cache_clear()
 
-        tpl_folder = st.session_state.get("cmp_tpl_input", "")
+        tpl_folder = convert_windows_path_for_server(st.session_state.get("cmp_tpl_input", ""))
         if not tpl_folder:
             st.warning("Please select a folder path.")
         else:
@@ -4101,7 +4100,7 @@ if st.session_state.get("cmp_done") and _can_place and _comparison_ran:
 
         with st.container(border=True):
             st.markdown("<h3 style='margin-top:0;'>🚀 Place Files</h3>", unsafe_allow_html=True)
-            out_folder = st.session_state.get("cmp_out_input", "")
+            out_folder = convert_windows_path_for_server(st.session_state.get("cmp_out_input", ""))
             if out_folder:
                 st.markdown(f"**Target Path:** `{out_folder}`")
 
@@ -4121,7 +4120,7 @@ if st.session_state.get("cmp_done") and _can_place and _comparison_ran:
             if not _already_placed:
                 if st.button("Place selected files", type="primary", key="cmp_place_btn", use_container_width=True):
                     # Do the work inline within the fragment rerun
-                    out_folder = st.session_state.get("cmp_out_input", "")
+                    out_folder = convert_windows_path_for_server(st.session_state.get("cmp_out_input", ""))
                     if not out_folder:
                         st.session_state["cmp_place_result"] = {"error": "No output folder set."}
                     else:
