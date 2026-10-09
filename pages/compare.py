@@ -3575,7 +3575,23 @@ def apply_fixes(findings, output_folder):
 # ===== Study Config =====
 import json
 
-CONFIG_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "study_config.json")
+# On Posit Connect the app directory is read-only.  Use a writable location
+# for the mutable study config: prefer the RSTUDIO_CONNECT_STORAGE env var,
+# then a /tmp fallback on the server, then the app dir (desktop).
+_APP_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if IS_SERVER:
+    _cfg_dir = os.environ.get("RSTUDIO_CONNECT_STORAGE") or os.path.join(
+        os.environ.get("TMPDIR", "/tmp"), "ifv_config"
+    )
+    os.makedirs(_cfg_dir, exist_ok=True)
+    CONFIG_FILE = os.path.join(_cfg_dir, "study_config.json")
+    # Seed from bundled copy on first run
+    _bundled = os.path.join(_APP_DIR, "study_config.json")
+    if not os.path.exists(CONFIG_FILE) and os.path.exists(_bundled):
+        import shutil
+        shutil.copy2(_bundled, CONFIG_FILE)
+else:
+    CONFIG_FILE = os.path.join(_APP_DIR, "study_config.json")
 
 
 def load_study_config():
@@ -3639,10 +3655,14 @@ with st.container(border=True):
         if st.session_state.get("_cmp_pending_src_dir"):
             st.session_state["cmp_src_input"] = st.session_state.pop("_cmp_pending_src_dir")
 
-    src_folder = st.text_input("Source folder path", placeholder=r"e.g., Z:\qa\study\data\raw\shared\input\cpt", key="cmp_src_input")
+    if not IS_SERVER:
+        src_folder = st.text_input("Source folder path", placeholder=r"e.g., Z:\qa\study\data\raw\shared\input\cpt", key="cmp_src_input")
+    else:
+        # In server mode, keep the session-state key alive but don't show
+        # the temp-upload path or info message — they aren't useful to users.
+        src_folder = st.session_state.get("cmp_src_input", "")
 
     if IS_SERVER:
-        st.info("💡 Select source files from your computer below. They will be uploaded for processing.")
         uploaded_src = st.file_uploader(
             "Browse files from your computer",
             type=["xlsx", "xls", "csv"],
@@ -3802,20 +3822,30 @@ if st.session_state.get("cmp_done") and st.session_state.get("cmp_selected"):
                 st.rerun()
 
         else:
-            # New study — browse button
-            if not IS_SERVER:
-                if st.button("Browse folder (template & output)", key="cmp_browse_folder"):
-                    sel = browse_folder()
-                    if sel:
-                        st.session_state["cmp_tpl_input"] = sel
-                        st.session_state["cmp_out_input"] = sel
-                        st.session_state.cmp_findings = []
-                        st.session_state.cmp_fixed = False
+            # New study — manual path entry + optional browse
+            _tpl_path_col, _tpl_browse_col = st.columns([5, 1.5])
+            with _tpl_path_col:
+                main_folder = st.text_input(
+                    "Folder path (used for comparison & placing)",
+                    placeholder=r"e.g., Z:\qa\study\data\raw\shared\input\cpt\Template",
+                    key="cmp_tpl_input",
+                    help="Type or paste a network-mapped path directly, or use Browse to navigate.",
+                )
+            with _tpl_browse_col:
+                st.markdown("<div style='height:1.62rem;'></div>", unsafe_allow_html=True)
+                if not IS_SERVER:
+                    if st.button("📂 Browse", key="cmp_browse_folder", use_container_width=True):
+                        sel = browse_folder()
+                        if sel:
+                            st.session_state["cmp_tpl_input"] = sel
+                            st.session_state["cmp_out_input"] = sel
+                            st.session_state.cmp_findings = []
+                            st.session_state.cmp_fixed = False
+                            st.rerun()
+                else:
+                    if st.button("📂 Browse", key="cmp_browse_folder_server", use_container_width=True):
+                        st.session_state["_fb_cmp_tpl_out_open"] = True
                         st.rerun()
-            else:
-                if st.button("📂 Browse server folder (template & output)", key="cmp_browse_folder_server"):
-                    st.session_state["_fb_cmp_tpl_out_open"] = True
-                    st.rerun()
 
             # Server folder browser dialog for template+output
             if st.session_state.get("_fb_cmp_tpl_out_open"):
@@ -3824,34 +3854,35 @@ if st.session_state.get("cmp_done") and st.session_state.get("cmp_selected"):
                     st.session_state.cmp_findings = []
                     st.session_state.cmp_fixed = False
 
-            _path_col2, _ = st.columns([2, 1])
-            with _path_col2:
-                main_folder = st.text_input(
-                    "Folder path (used for comparison & placing)",
-                    placeholder=r"e.g., Z:\qa\study\data\raw\shared\input\cpt\Template",
-                    key="cmp_tpl_input"
-                )
             if main_folder and not st.session_state.get("cmp_out_input"):
                 st.session_state["cmp_out_input"] = main_folder
 
             with st.expander("Advanced: Use separate Output folder", expanded=False):
                 st.caption("By default, files are placed in the same folder used for comparison.")
-                if not IS_SERVER:
-                    if st.button("Browse output folder", key="cmp_browse_out"):
-                        sel = browse_folder()
-                        if sel:
-                            st.session_state["cmp_out_input"] = sel
+                _out_path_col, _out_browse_col = st.columns([5, 1.5])
+                with _out_path_col:
+                    st.text_input(
+                        "Output folder (if different)",
+                        key="cmp_out_input",
+                        placeholder=r"e.g., Z:\qa\study\data\raw\shared\input\metrics\Template",
+                        help="Type or paste a path directly, or use Browse to navigate.",
+                    )
+                with _out_browse_col:
+                    st.markdown("<div style='height:1.62rem;'></div>", unsafe_allow_html=True)
+                    if not IS_SERVER:
+                        if st.button("📂 Browse", key="cmp_browse_out", use_container_width=True):
+                            sel = browse_folder()
+                            if sel:
+                                st.session_state["cmp_out_input"] = sel
+                                st.rerun()
+                    else:
+                        if st.button("📂 Browse", key="cmp_browse_out_server", use_container_width=True):
+                            st.session_state["_fb_cmp_out_open"] = True
                             st.rerun()
-                else:
-                    if st.button("📂 Browse server folder", key="cmp_browse_out_server"):
-                        st.session_state["_fb_cmp_out_open"] = True
-                        st.rerun()
 
                 # Server folder browser dialog for output only
                 if st.session_state.get("_fb_cmp_out_open"):
                     server_folder_browser("cmp_out", target_keys=["cmp_out_input"])
-
-                st.text_input("Output folder (if different)", key="cmp_out_input")
 
             # Save & Compare button
             if main_folder:
