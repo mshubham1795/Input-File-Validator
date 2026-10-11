@@ -18,6 +18,7 @@ import html as html_mod
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import Counter
 import functools
+import dataclasses
 import numpy as np
 import zipfile
 
@@ -28,6 +29,534 @@ from utils import (
     IS_SERVER, save_uploaded_files, server_folder_browser,
     convert_windows_path_for_server,
 )
+
+# ---------------------------------------------------------------------------
+# Built-in numFmtId lookup table (Excel ECMA-376 §18.8.30)
+# ---------------------------------------------------------------------------
+_BUILTIN_NUMFMT_CODES = {
+    14: "mm-dd-yy",
+    15: "d-mmm-yy",
+    16: "d-mmm",
+    17: "mmm-yy",
+    18: "h:mm AM/PM",
+    19: "h:mm:ss AM/PM",
+    20: "h:mm",
+    21: "h:mm:ss",
+    22: "m/d/yy h:mm",
+    45: "mm:ss",
+    46: "[h]:mm:ss",
+    47: "mmss.0",
+}
+_BUILTIN_CODE_TO_ID = {v.lower(): k for k, v in _BUILTIN_NUMFMT_CODES.items()}
+
+
+# ---------------------------------------------------------------------------
+# DateSignature — frozen dataclass replacing the old label system
+# ---------------------------------------------------------------------------
+@dataclasses.dataclass(frozen=True)
+class DateSignature:
+    """Canonical structural fingerprint of a date format."""
+    order: str            # "MDY" | "DMY" | "YMD"
+    sep: str              # "/" | "-" | "." | " "
+    year_digits: int      # 2 | 4
+    month_style: str      # "numeric" | "abbrev" | "full"
+    has_time: bool = False
+    ampm: bool = False
+    locale_dependent: bool = False
+
+    def to_dict(self):
+        return dataclasses.asdict(self)
+
+
+def _excel_code_to_signature(excel_code, numfmt_id=None):
+    """Parse an Excel number_format code into a DateSignature.
+
+    Returns None if the code is not a date format (e.g. General, number, text).
+    If numfmt_id is a built-in date ID (14-22, 45-47), resolves from lookup table.
+    """
+    # Handle None / empty
+    if not excel_code and numfmt_id is None:
+        return None
+    if not excel_code or excel_code in ("General", "general", "@"):
+        if numfmt_id is not None and numfmt_id in _BUILTIN_NUMFMT_CODES:
+            excel_code = _BUILTIN_NUMFMT_CODES[numfmt_id]
+        else:
+            return None
+
+    locale_dep = numfmt_id is not None and numfmt_id in _BUILTIN_NUMFMT_CODES
+    code = excel_code
+
+    # Strip locale prefix [$-xxx]
+    code = re.sub(r'\[\$\-[^\]]*\]', '', code)
+    # Strip alternate format sections (keep first section before ;)
+    if ';' in code:
+        code = code.split(';')[0]
+    # Strip escaped characters (e.g. \- \/ \.)
+    code = re.sub(r'\\(.)', r'\1', code)
+    # Strip quoted strings (keep content for separator detection but mark for removal)
+    code_no_quotes = re.sub(r'"[^"]*"', '', code)
+    # Strip color/condition sections [Red], [>100], etc (but not [h])
+    code_no_quotes = re.sub(r'\[[^\]]*\]', '', code_no_quotes)
+
+    # Lowercase for token matching
+    lc = code_no_quotes.lower().strip()
+    if not lc:
+        return None
+
+    # Tokenize: walk through and identify Y, M, D, H, S, AM/PM tokens and separators
+    tokens = []  # list of (type, raw) where type is Y/M/D/H/S/AMPM/SEP/OTHER
+    i = 0
+    while i < len(lc):
+        ch = lc[i]
+        if ch == 'y':
+            j = i
+            while j < len(lc) and lc[j] == 'y':
+                j += 1
+            tokens.append(('Y', lc[i:j]))
+            i = j
+        elif ch == 'm':
+            j = i
+            while j < len(lc) and lc[j] == 'm':
+                j += 1
+            raw = lc[i:j]
+            # Disambiguate month vs minute: m/mm after h/hh (possibly with : or space) = minute
+            prev_types = [t[0] for t in tokens]
+            is_minute = False
+            if prev_types and prev_types[-1] == 'H':
+                is_minute = True
+            elif prev_types and prev_types[-1] in ('COLON', 'SEP') and len(prev_types) >= 2 and prev_types[-2] == 'H':
+                is_minute = True
+            if not is_minute:
+                # Check if followed by s (look ahead past separators)
+                k = j
+                while k < len(lc) and lc[k] in ' :':
+                    k += 1
+                if k < len(lc) and lc[k] == 's':
+                    # But only if no day token seen yet — if we already have D, this m is month
+                    if 'D' not in prev_types and 'Y' not in prev_types:
+                        is_minute = True
+            if is_minute:
+                tokens.append(('MIN', raw))
+            else:
+                tokens.append(('M', raw))
+            i = j
+        elif ch == 'd':
+            j = i
+            while j < len(lc) and lc[j] == 'd':
+                j += 1
+            raw = lc[i:j]
+            if len(raw) <= 2:  # ddd/dddd = day-of-week, not date
+                tokens.append(('D', raw))
+            i = j
+        elif ch == 'h':
+            j = i
+            while j < len(lc) and lc[j] == 'h':
+                j += 1
+            tokens.append(('H', lc[i:j]))
+            i = j
+        elif ch == 's':
+            j = i
+            while j < len(lc) and lc[j] == 's':
+                j += 1
+            tokens.append(('S', lc[i:j]))
+            i = j
+        elif ch == 'a' and i + 1 < len(lc) and lc[i:i+4] in ('am/p', 'a/p'):
+            # AM/PM or A/P
+            if lc[i:i+5] == 'am/pm':
+                tokens.append(('AMPM', 'am/pm'))
+                i += 5
+            elif lc[i:i+3] == 'a/p':
+                tokens.append(('AMPM', 'a/p'))
+                i += 3
+            else:
+                i += 1
+        elif ch in '/-. ':
+            tokens.append(('SEP', ch))
+            i += 1
+        elif ch == ':':
+            tokens.append(('COLON', ch))
+            i += 1
+        else:
+            i += 1
+
+    # Extract date component order
+    date_tokens = [t for t in tokens if t[0] in ('Y', 'M', 'D')]
+    if len(date_tokens) < 2:
+        return None  # Not a recognizable date format
+
+    order_str = ''.join(t[0] for t in date_tokens)
+    # Map to canonical order
+    order_map = {
+        'YMD': 'YMD', 'YDM': 'YMD',  # treat YDM as YMD (rare)
+        'MDY': 'MDY', 'MYD': 'MDY',
+        'DMY': 'DMY', 'DYM': 'DMY',
+        'YM': 'YMD', 'MY': 'MDY', 'DM': 'DMY', 'MD': 'MDY',
+        'YD': 'YMD', 'DY': 'DMY',
+    }
+    order = order_map.get(order_str)
+    if order is None:
+        return None
+
+    # Extract separator between first two date components
+    sep = "-"  # default
+    date_indices = [i for i, t in enumerate(tokens) if t[0] in ('Y', 'M', 'D')]
+    if len(date_indices) >= 2:
+        # Look for separator tokens between the first two date tokens
+        for idx in range(date_indices[0] + 1, date_indices[1]):
+            if tokens[idx][0] == 'SEP':
+                sep = tokens[idx][1]
+                break
+
+    # Year digits
+    y_tokens = [t for t in tokens if t[0] == 'Y']
+    year_digits = 4
+    if y_tokens:
+        year_digits = len(y_tokens[0][1])  # yy=2, yyyy=4
+
+    # Month style
+    m_tokens = [t for t in tokens if t[0] == 'M']
+    month_style = "numeric"
+    if m_tokens:
+        mlen = len(m_tokens[0][1])
+        if mlen >= 4:
+            month_style = "full"      # mmmm+
+        elif mlen == 3:
+            month_style = "abbrev"    # mmm
+
+    # Time
+    has_time = any(t[0] == 'H' for t in tokens)
+    ampm = any(t[0] == 'AMPM' for t in tokens)
+
+    return DateSignature(
+        order=order,
+        sep=sep,
+        year_digits=year_digits,
+        month_style=month_style,
+        has_time=has_time,
+        ampm=ampm,
+        locale_dependent=locale_dep,
+    )
+
+
+def _signature_to_strftime(sig):
+    """Derive a Python strftime format string from a DateSignature."""
+    if sig is None:
+        return "%Y-%m-%d"
+
+    # Build date part
+    if sig.month_style == "abbrev":
+        m_fmt = "%b"
+    elif sig.month_style == "full":
+        m_fmt = "%B"
+    else:
+        m_fmt = "%m"
+
+    d_fmt = "%d"
+    y_fmt = "%Y" if sig.year_digits == 4 else "%y"
+
+    parts_map = {'Y': y_fmt, 'M': m_fmt, 'D': d_fmt}
+    date_parts = [parts_map[c] for c in sig.order]
+    date_str = sig.sep.join(date_parts)
+
+    if sig.has_time:
+        if sig.ampm:
+            date_str += " %I:%M:%S %p"
+        else:
+            date_str += " %H:%M:%S"
+
+    return date_str
+
+
+def _signature_to_parse_format(sig):
+    """Derive a strptime-compatible parse pattern from a DateSignature.
+
+    Uses standard format codes (no platform-specific %-m etc.).
+    """
+    if sig is None:
+        return "%Y-%m-%d"
+
+    if sig.month_style == "abbrev":
+        m_fmt = "%b"
+    elif sig.month_style == "full":
+        m_fmt = "%B"
+    else:
+        m_fmt = "%m"
+
+    d_fmt = "%d"
+    y_fmt = "%Y" if sig.year_digits == 4 else "%y"
+
+    parts_map = {'Y': y_fmt, 'M': m_fmt, 'D': d_fmt}
+    date_parts = [parts_map[c] for c in sig.order]
+    date_str = sig.sep.join(date_parts)
+
+    if sig.has_time:
+        if sig.ampm:
+            date_str += " %I:%M:%S %p"
+        else:
+            date_str += " %H:%M:%S"
+
+    return date_str
+
+
+def _signature_to_excel_code(sig):
+    """Reconstruct an Excel format code from a DateSignature."""
+    if sig is None:
+        return "yyyy-mm-dd"
+
+    if sig.month_style == "abbrev":
+        m_part = "mmm"
+    elif sig.month_style == "full":
+        m_part = "mmmm"
+    else:
+        m_part = "mm"
+
+    d_part = "dd"
+    y_part = "yyyy" if sig.year_digits == 4 else "yy"
+
+    parts_map = {'Y': y_part, 'M': m_part, 'D': d_part}
+    date_parts = [parts_map[c] for c in sig.order]
+    code = sig.sep.join(date_parts)
+
+    if sig.has_time:
+        if sig.ampm:
+            code += " h:mm:ss AM/PM"
+        else:
+            code += " hh:mm:ss"
+
+    return code
+
+
+def _text_value_to_signature(values, template_hint=None):
+    """Infer a DateSignature from a list of text date values (column-level).
+
+    Samples all provided values, resolves ambiguous day/month order using
+    template_hint if available, else falls back to separator heuristic
+    (slash→MDY, dash/dot→DMY).
+
+    Returns None if no date pattern is detected.
+    """
+    if not values:
+        return None
+
+    # Regex patterns
+    _ISO_RE = re.compile(r'^(\d{4})([-/.])(\d{1,2})\2(\d{1,2})')
+    _NUMERIC_RE = re.compile(r'^(\d{1,2})([-/.])(\d{1,2})\2(\d{2,4})')
+    _MONTH_ABBR_RE = re.compile(r'^(\d{1,2})([-/ ])([A-Za-z]{3})([-/ ])(\d{2,4})', re.I)
+    _MONTH_FULL_RE = re.compile(r'^(\d{1,2})([-/ ])([A-Za-z]{4,})([-/ ])(\d{2,4})', re.I)
+    _TIME_RE = re.compile(r'[\sT]\d{1,2}:\d{2}')
+    _AMPM_RE = re.compile(r'\s*[AaPp][Mm]/?[PpMm]?\s*$')
+
+    # Classify
+    iso_count = 0
+    numeric_count = 0
+    abbrev_count = 0
+    full_count = 0
+    date_count = 0
+    has_time_count = 0
+    has_ampm_count = 0
+
+    # For disambiguation
+    field1_gt12 = 0
+    field2_gt12 = 0
+    seps = Counter()
+    year_lens = Counter()
+
+    for val in values:
+        val = str(val).strip()
+        if not val:
+            continue
+
+        has_time = bool(_TIME_RE.search(val))
+        has_ampm = bool(_AMPM_RE.search(val))
+        # Strip time for date pattern matching
+        date_part = re.split(r'[\sT]\d{1,2}:\d{2}', val)[0].strip()
+
+        m = _ISO_RE.match(date_part)
+        if m:
+            iso_count += 1
+            date_count += 1
+            seps[m.group(2)] += 1
+            year_lens[4] += 1
+            if has_time:
+                has_time_count += 1
+            if has_ampm:
+                has_ampm_count += 1
+            continue
+
+        m = _MONTH_FULL_RE.match(date_part)
+        if m:
+            full_count += 1
+            date_count += 1
+            seps[m.group(2)] += 1
+            yl = len(m.group(5))
+            year_lens[4 if yl == 4 else 2] += 1
+            if has_time:
+                has_time_count += 1
+            if has_ampm:
+                has_ampm_count += 1
+            continue
+
+        m = _MONTH_ABBR_RE.match(date_part)
+        if m:
+            abbrev_count += 1
+            date_count += 1
+            seps[m.group(2)] += 1
+            yl = len(m.group(5))
+            year_lens[4 if yl == 4 else 2] += 1
+            if has_time:
+                has_time_count += 1
+            if has_ampm:
+                has_ampm_count += 1
+            continue
+
+        m = _NUMERIC_RE.match(date_part)
+        if m:
+            numeric_count += 1
+            date_count += 1
+            f1, sep_ch, f2, yr = int(m.group(1)), m.group(2), int(m.group(3)), m.group(4)
+            seps[sep_ch] += 1
+            year_lens[4 if len(yr) == 4 else 2] += 1
+            if f1 > 12:
+                field1_gt12 += 1
+            if f2 > 12:
+                field2_gt12 += 1
+            if has_time:
+                has_time_count += 1
+            if has_ampm:
+                has_ampm_count += 1
+            continue
+
+    if date_count == 0:
+        return None
+
+    # Determine sep
+    sep = seps.most_common(1)[0][0] if seps else "-"
+    # Determine year_digits
+    year_digits = year_lens.most_common(1)[0][0] if year_lens else 4
+
+    # Determine order and month_style
+    has_time = has_time_count > date_count * 0.3
+    ampm = has_ampm_count > 0
+
+    if iso_count > 0 and iso_count >= date_count * 0.5:
+        return DateSignature(order="YMD", sep=sep, year_digits=year_digits,
+                             month_style="numeric", has_time=has_time,
+                             ampm=ampm, locale_dependent=False)
+
+    if full_count > 0 and full_count >= date_count * 0.5:
+        return DateSignature(order="DMY", sep=sep, year_digits=year_digits,
+                             month_style="full", has_time=has_time,
+                             ampm=ampm, locale_dependent=False)
+
+    if abbrev_count > 0 and abbrev_count >= date_count * 0.5:
+        return DateSignature(order="DMY", sep=sep, year_digits=year_digits,
+                             month_style="abbrev", has_time=has_time,
+                             ampm=ampm, locale_dependent=False)
+
+    # Numeric dates — resolve order
+    if field2_gt12 > 0 and field1_gt12 == 0:
+        order = "MDY"  # second field has values >12, so it is day → month first
+    elif field1_gt12 > 0 and field2_gt12 == 0:
+        order = "DMY"  # first field has values >12, so it is day → day first
+    elif template_hint is not None:
+        order = template_hint.order
+    else:
+        # Separator heuristic
+        if sep == "/":
+            order = "MDY"
+        else:
+            order = "DMY"
+
+    return DateSignature(order=order, sep=sep, year_digits=year_digits,
+                         month_style="numeric", has_time=has_time,
+                         ampm=ampm, locale_dependent=False)
+
+
+def _convert_date_column(df, col_name, source_sig, target_sig, target_excel_code):
+    """Parse a date column ONCE into datetime64, preserving unparseable values.
+
+    Modifies df[col_name] in place. Returns the target_excel_code for date_fmt_map.
+    Unparseable values keep their original text (never NaT or blank).
+    """
+    col = df[col_name]
+
+    # If already datetime, nothing to parse
+    if hasattr(col.dtype, 'kind') and col.dtype.kind == 'M':
+        return target_excel_code
+
+    # Get parse format from source signature
+    parse_fmt = _signature_to_parse_format(source_sig) if source_sig else None
+
+    # Save original values for NaT recovery
+    original = col.copy()
+
+    # Handle numeric (Excel serial) values
+    if col.dtype.kind in ('f', 'i'):
+        excel_epoch = pd.Timestamp('1899-12-30')
+        try:
+            parsed = pd.to_timedelta(col, unit='D') + excel_epoch
+            df[col_name] = parsed
+            return target_excel_code
+        except Exception:
+            pass
+
+    # String parsing
+    series = col.astype(str)
+
+    # Clean ISO artifacts
+    cleaned = series.str.strip()
+    cleaned = cleaned.str.replace(r'Z$', '', regex=True)
+    cleaned = cleaned.str.replace(r'T(\d)', r' \1', regex=True)
+    # Strip timezone offset but only if : present (avoid corrupting dash-dates)
+    cleaned = cleaned.str.replace(r'[+-]\d{2}:\d{2}$', '', regex=True)
+
+    parsed = pd.Series([pd.NaT] * len(df), index=df.index)
+
+    # Try with known format
+    if parse_fmt:
+        try:
+            parsed = pd.to_datetime(cleaned, format=parse_fmt, errors='coerce')
+        except Exception:
+            pass
+
+        # If too many NaT, try without seconds
+        nat_ratio = parsed.isna().sum() / max(len(parsed), 1)
+        if nat_ratio > 0.3 and source_sig and source_sig.has_time:
+            fmt_no_sec = parse_fmt.replace(':%S', '').replace('%S', '')
+            try:
+                fallback = pd.to_datetime(cleaned, format=fmt_no_sec, errors='coerce')
+                # Fill in where primary failed
+                mask = parsed.isna() & fallback.notna()
+                parsed = parsed.where(~mask, fallback)
+            except Exception:
+                pass
+
+    # Final fallback: let pandas infer
+    nat_ratio = parsed.isna().sum() / max(len(parsed), 1)
+    if nat_ratio > 0.3:
+        dayfirst = source_sig.order == "DMY" if source_sig else False
+        try:
+            fallback = pd.to_datetime(cleaned, errors='coerce', dayfirst=dayfirst)
+            mask = parsed.isna() & fallback.notna()
+            parsed = parsed.where(~mask, fallback)
+        except Exception:
+            pass
+
+    # NaT prevention: keep original text for unparseable values
+    nat_mask = parsed.isna()
+    non_empty_mask = original.astype(str).str.strip().ne('') & original.notna()
+    keep_original = nat_mask & non_empty_mask
+
+    if keep_original.any():
+        # Convert to object dtype to hold mixed datetime + string
+        result = parsed.astype(object)
+        result[keep_original] = original[keep_original]
+        df[col_name] = result
+    else:
+        df[col_name] = parsed
+
+    return target_excel_code
+
 
 # --- Shared date format constants ---
 # Mapping: format label → Python strftime format string
@@ -227,12 +756,39 @@ def _canonical_date_signature(format_label):
 
 
 def _date_signatures_match(sig1, sig2):
-    """Compare two canonical date signatures for structural equivalence.
+    """Compare two date signatures for structural equivalence.
 
-    Returns True if the formats are structurally the same (no finding needed).
-    Time precision differences (has_time vs not) are NOT flagged.
-    Only the date_signature (component order + delimiter) matters.
+    Accepts either:
+      - Two DateSignature instances (new system)
+      - Two (date_part, has_time) tuples (legacy system)
+
+    Returns (match: bool, diff_fields: list[str]) when both are DateSignature,
+    or a plain bool for legacy tuple inputs (backward compatibility).
     """
+    # Handle DateSignature instances (new system)
+    if isinstance(sig1, DateSignature) or isinstance(sig2, DateSignature) or sig1 is None or sig2 is None:
+        if sig1 is None or sig2 is None:
+            return (True, [])
+        if not isinstance(sig1, DateSignature) or not isinstance(sig2, DateSignature):
+            return (True, [])
+
+        diffs = []
+        if sig1.order != sig2.order:
+            diffs.append(f"order: {sig1.order} vs {sig2.order}")
+        if sig1.sep != sig2.sep:
+            diffs.append(f"separator: '{sig1.sep}' vs '{sig2.sep}'")
+        if sig1.year_digits != sig2.year_digits:
+            diffs.append(f"year digits: {sig1.year_digits} vs {sig2.year_digits}")
+        if sig1.month_style != sig2.month_style:
+            diffs.append(f"month style: {sig1.month_style} vs {sig2.month_style}")
+        if sig1.has_time != sig2.has_time:
+            diffs.append(f"time component: {sig1.has_time} vs {sig2.has_time}")
+        if sig1.ampm != sig2.ampm:
+            diffs.append(f"AM/PM: {sig1.ampm} vs {sig2.ampm}")
+
+        return (len(diffs) == 0, diffs)
+
+    # Legacy tuple path: (date_part, has_time)
     date1, _ = sig1
     date2, _ = sig2
 
@@ -736,6 +1292,7 @@ def detect_column_types(file_path, sheet_name, hdr_row, max_sample=15):
             fmt = "General"
             detected_formats = []
 
+            raw_excel_codes = []  # track raw Excel codes for signature computation
             for s in col_samples:
                 val = s["value"]
                 nfmt = s["format"]
@@ -844,10 +1401,15 @@ def detect_column_types(file_path, sheet_name, hdr_row, max_sample=15):
                 # Flag columns where most date cells had "General" number_format
                 # (display depends on OS locale, not an explicit Excel format code)
                 is_general = general_date_count > 0 and general_date_count >= date_count / 2
+                # Compute signature from the format label or raw Excel code
+                excel_code = _DATE_FMT_LABEL_TO_EXCEL.get(fmt, fmt.lower() if fmt not in _TEXT_DATE_LABELS else "")
+                sig = _excel_code_to_signature(excel_code) if excel_code else None
                 types[col_i] = {"header": str(hdr_val).strip(), "type": dtype_result, "format": fmt,
                                 "format_consistency": round(consistency, 2),
                                 "format_variants": len(fmt_counts),
-                                "general_date": is_general}
+                                "general_date": is_general,
+                                "excel_code": excel_code,
+                                "signature": sig}
             elif dtype_result != "date":
                 fmt = "General"
                 types[col_i] = {"header": str(hdr_val).strip(), "type": dtype_result, "format": fmt}
@@ -880,10 +1442,9 @@ def _is_numeric_str(s):
 
 @functools.lru_cache(maxsize=128)
 def _detect_csv_column_types(file_path, max_sample=15):
-    """Detect data types for CSV columns using the same format-label logic as
-    the template (openpyxl text-cell) detection.
+    """Detect data types for CSV columns using regex-based format detection.
 
-    Uses the SAME regex patterns as _detect_types_uncached so that identical
+    Uses the SAME regex patterns as the XLSX text-cell detection so that identical
     text-date formats in both files produce the same label — ensuring only REAL
     format differences trigger a finding.
     """
@@ -937,9 +1498,14 @@ def _detect_csv_column_types(file_path, max_sample=15):
                     fmt = fmt_counts.most_common(1)[0][0] if detected_formats else "General"
                     # Format consistency: ratio of dominant format to total detected
                     consistency = fmt_counts.most_common(1)[0][1] / len(detected_formats) if detected_formats else 0.0
+                    # Compute signature from the format label
+                    excel_code = _DATE_FMT_LABEL_TO_EXCEL.get(fmt, fmt.lower() if fmt not in _TEXT_DATE_LABELS else "")
+                    sig = _excel_code_to_signature(excel_code) if excel_code else None
                     types[col_i] = {"header": str(col_name).strip(), "type": "date", "format": fmt,
                                     "format_consistency": round(consistency, 2),
-                                    "format_variants": len(fmt_counts)}
+                                    "format_variants": len(fmt_counts),
+                                    "excel_code": excel_code,
+                                    "signature": sig}
                 elif num_count > 0 and num_count > text_count:
                     types[col_i] = {"header": str(col_name).strip(), "type": "numeric", "format": "General"}
                 else:
@@ -1310,32 +1876,31 @@ def _compare_date_columns(placed_path, template_path,
                           max_sample=10):
     """Structurally compare date columns between placed and template.
 
-    Uses CANONICAL SIGNATURES for the primary decision — does NOT compare
-    actual row-by-row date values (the template holds different data from the
-    placed file, making value comparison meaningless for structural decisions).
+    Uses DateSignature for the primary decision — does NOT compare
+    actual row-by-row date values.
 
     Returns a dict with:
         classification: "no_mismatch" | "format_mismatch" | "data_type"
         details: Human-readable explanation
-        placed_storage: "native_date" | "text_date" | "mixed" | "unknown"
-        template_storage: same
-        placed_signature: (date_part, has_time)
-        template_signature: (date_part, has_time)
-        mismatch_reason: Explanation of why signatures differ (if they do)
+        placed_storage / template_storage: "native_date" | "text_date" | "mixed" | "unknown"
+        placed_signature / template_signature: DateSignature or None
+        diff_fields: list of specific field differences
     """
     result = {
         "classification": "no_mismatch",
         "details": "",
         "placed_storage": "unknown",
         "template_storage": "unknown",
-        "placed_signature": (None, False),
-        "template_signature": (None, False),
-        "mismatch_reason": "",
+        "placed_signature": None,
+        "template_signature": None,
+        "diff_fields": [],
     }
 
-    # Step 1: Derive canonical signatures
-    p_sig = _canonical_date_signature(p_fmt)
-    t_sig = _canonical_date_signature(t_fmt)
+    # Step 1: Derive signatures
+    p_excel = _DATE_FMT_LABEL_TO_EXCEL.get(p_fmt, p_fmt)
+    t_excel = _DATE_FMT_LABEL_TO_EXCEL.get(t_fmt, t_fmt)
+    p_sig = _excel_code_to_signature(p_excel)
+    t_sig = _excel_code_to_signature(t_excel)
     result["placed_signature"] = p_sig
     result["template_signature"] = t_sig
 
@@ -1347,117 +1912,18 @@ def _compare_date_columns(placed_path, template_path,
     result["placed_storage"] = p_storage
     result["template_storage"] = t_storage
 
-    # Step 3: Compare canonical signatures (structural format comparison)
-    if _date_signatures_match(p_sig, t_sig):
+    # Step 3: Compare signatures
+    match, diff_fields = _date_signatures_match(p_sig, t_sig)
+    if match:
         result["classification"] = "no_mismatch"
         result["details"] = "Date format signatures are identical."
-        result["mismatch_reason"] = "Date format signatures are identical."
         return result
 
-    # Signatures differ — determine the nature of the mismatch
-    reason = _describe_signature_mismatch(p_sig, t_sig)
     result["classification"] = "format_mismatch"
     result["details"] = f"Format mismatch: {p_fmt} vs {t_fmt}"
-    result["mismatch_reason"] = reason
+    result["diff_fields"] = diff_fields
 
     return result
-
-
-def _detect_types_uncached(file_path, sheet_name, hdr_row, max_sample=15):
-    """Run the same detection logic as detect_column_types without LRU cache."""
-    types = {}
-    try:
-        wb = openpyxl.load_workbook(file_path, read_only=True, keep_links=False, data_only=True)
-        ws = wb[sheet_name]
-        headers = []
-        samples = {}
-
-        for row_idx, row in enumerate(ws.iter_rows(min_row=1, max_row=hdr_row + max_sample, max_col=100), 1):
-            if row_idx == hdr_row:
-                headers = [(cell.value, i) for i, cell in enumerate(row) if cell.value is not None and str(cell.value).strip()]
-            elif row_idx > hdr_row:
-                for i, cell in enumerate(row):
-                    col_i = i
-                    if cell.value is not None and str(cell.value).strip():
-                        if col_i not in samples:
-                            samples[col_i] = []
-                        samples[col_i].append({
-                            "value": cell.value,
-                            "format": cell.number_format,
-                            "dtype": cell.data_type,
-                        })
-
-        wb.close()
-
-        for hdr_val, col_i in headers:
-            if hdr_val is None or not str(hdr_val).strip():
-                continue
-            col_samples = samples.get(col_i, [])
-            if not col_samples:
-                types[col_i] = {"header": str(hdr_val).strip(), "type": "unknown", "format": "General"}
-                continue
-
-            date_count = num_count = text_count = 0
-            general_date_count = 0  # native dates with "General" number_format
-            fmt = "General"
-            detected_formats = []
-
-            for s in col_samples:
-                val = s["value"]
-                nfmt = s["format"]
-                cell_dtype = s["dtype"]
-
-                if cell_dtype == "d":
-                    date_count += 1
-                    if nfmt and nfmt != "General":
-                        detected_formats.append(nfmt)
-                    else:
-                        detected_formats.append("YYYY-MM-DD")
-                elif cell_dtype == "n":
-                    if nfmt and any(x in nfmt.lower() for x in ["yy", "mm", "dd", "m/d", "d-", "d/", "mmm"]):
-                        date_count += 1
-                        detected_formats.append(nfmt)
-                    else:
-                        num_count += 1
-                elif cell_dtype == "s" or isinstance(val, str):
-                    val_str = str(val).strip()
-                    date_text_fmt = _detect_date_text_format(val_str)
-
-                    if date_text_fmt:
-                        date_count += 1
-                        detected_formats.append(date_text_fmt)
-                    else:
-                        text_count += 1
-                else:
-                    if isinstance(val, datetime.datetime):
-                        date_count += 1
-                        detected_formats.append("YYYY-MM-DD")
-                    elif isinstance(val, (int, float)):
-                        num_count += 1
-                    else:
-                        text_count += 1
-
-            total = date_count + num_count + text_count
-            if total == 0:
-                dtype_result = "unknown"
-            elif date_count > 0 and date_count >= num_count and date_count >= text_count:
-                dtype_result = "date"
-                if detected_formats:
-                    from collections import Counter
-                    fmt = Counter(detected_formats).most_common(1)[0][0]
-                else:
-                    fmt = "General"
-            elif num_count > 0 and num_count > text_count:
-                dtype_result = "numeric"
-                fmt = "General"
-            else:
-                dtype_result = "text"
-                fmt = "General"
-
-            types[col_i] = {"header": str(hdr_val).strip(), "type": dtype_result, "format": fmt}
-    except Exception:
-        pass
-    return types
 
 
 def compare_file_pair(placed_path, template_path, placed_name, template_name):
@@ -1872,25 +2338,48 @@ def _deeper_analysis(findings, placed_path, template_path, placed_name,
                     continue  # Can't determine template display format → no finding
 
                 # --- Canonical signature comparison ---
-                # Derives structural fingerprint: component order + delimiter.
-                # Time precision (HH:MM vs HH:MM:SS, or time present vs absent)
-                # is NOT treated as a structural mismatch.
-                p_sig = _canonical_date_signature(p_fmt)
-                t_sig = _canonical_date_signature(t_fmt)
+                # Use DateSignature objects from detection when available,
+                # fall back to computing from format labels/excel codes.
+                p_sig = p_info.get("signature")
+                t_sig = t_info.get("signature")
+                if p_sig is None and p_fmt:
+                    p_excel = p_info.get("excel_code") or _DATE_FMT_LABEL_TO_EXCEL.get(p_fmt, "")
+                    p_sig = _excel_code_to_signature(p_excel) if p_excel else None
+                if t_sig is None and t_fmt:
+                    t_excel = t_info.get("excel_code") or _DATE_FMT_LABEL_TO_EXCEL.get(t_fmt, "")
+                    t_sig = _excel_code_to_signature(t_excel) if t_excel else None
 
-                if _date_signatures_match(p_sig, t_sig):
-                    continue  # Same structural format → no finding
+                # Compare using DateSignature (returns field-level diffs)
+                if isinstance(p_sig, DateSignature) or isinstance(t_sig, DateSignature):
+                    match_result, diff_fields = _date_signatures_match(p_sig, t_sig)
+                    if match_result:
+                        continue  # Same structural format → no finding
+                else:
+                    # Legacy tuple path
+                    p_sig_legacy = _canonical_date_signature(p_fmt)
+                    t_sig_legacy = _canonical_date_signature(t_fmt)
+                    if _date_signatures_match(p_sig_legacy, t_sig_legacy):
+                        continue
+                    diff_fields = []
 
                 # Real format mismatch found — flag it
                 check_label = f"Date Format ({p_info['header']})"
+                # Use excel codes in finding values when available
+                p_display = p_info.get("excel_code") or p_fmt
+                t_display = t_info.get("excel_code") or t_fmt
 
                 findings.append({
                     "File": placed_name, "Check": check_label,
-                    "Placed Value": p_fmt, "Template Value": t_fmt,
+                    "Placed Value": p_display, "Template Value": t_display,
                     "fix_type": "fix_data_type",
                     "fix_data": {"sheet": placed_sheet, "col_idx": col_i, "hdr_row": placed_hdr_row,
                                  "from_type": "date", "to_type": "date", "target_format": t_fmt,
                                  "source_format": p_fmt,
+                                 "target_excel_code": t_info.get("excel_code", ""),
+                                 "source_excel_code": p_info.get("excel_code", ""),
+                                 "target_signature": t_sig.to_dict() if isinstance(t_sig, DateSignature) else None,
+                                 "source_signature": p_sig.to_dict() if isinstance(p_sig, DateSignature) else None,
+                                 "diff_fields": diff_fields,
                                  "template_path": template_path, "tpl_col_idx": tpl_col_actual,
                                  "tpl_hdr_row": tpl_hdr_row,
                                  "is_csv": is_placed_csv,
@@ -2613,7 +3102,9 @@ def _write_df_to_xlsx_vectorized(df, file_path, sheet_name="Sheet1", date_format
     """Core vectorized XLSX writer. Builds XML using numpy char operations.
 
     Args:
-        date_formats: optional dict {col_name: excel_format_code} for native date styling.
+        date_formats: optional dict {col_name: fmt} where fmt is either:
+            - a string (legacy: Excel format code), or
+            - a dict {"excel_code": str, "numfmt_id": int|None} (new format).
     """
     rows_count = len(df)
     cols_count = len(df.columns)
@@ -2624,14 +3115,47 @@ def _write_df_to_xlsx_vectorized(df, file_path, sheet_name="Sheet1", date_format
     # Row number strings (data rows start at row 2; row 1 is the header)
     row_nums_np = np.arange(2, rows_count + 2).astype('U10')
 
-    # Track date styles: map col_name → style_index (1-based, 0 is "General")
+    # Normalize date_formats to {col_name: {"excel_code": str, "numfmt_id": int|None}}
     date_formats = date_formats or {}
-    # Build unique format list: each unique Excel format code gets its own style index
-    _unique_fmts = list(dict.fromkeys(date_formats.values()))  # preserve order, deduplicate
-    _fmt_to_style = {fmt: idx + 1 for idx, fmt in enumerate(_unique_fmts)}
-    # Map column name → style index string
-    _col_style = {col_name: str(_fmt_to_style[fmt]) for col_name, fmt in date_formats.items()}
-    has_dates = bool(_unique_fmts)
+    _norm_fmts = {}
+    for col_name, fmt in date_formats.items():
+        if isinstance(fmt, str):
+            _norm_fmts[col_name] = {"excel_code": fmt, "numfmt_id": None}
+        else:
+            _norm_fmts[col_name] = fmt
+
+    # Build unique format list and assign numFmt IDs
+    # Built-in IDs (< 164) are used directly; custom IDs start at 164
+    _seen_codes = {}  # excel_code -> {"style_idx": int, "numfmt_id": int}
+    _custom_id_next = 164
+    _col_style = {}  # col_name -> style_idx string
+    _style_list = []  # ordered list of {"excel_code": str, "numfmt_id": int, "is_builtin": bool}
+
+    for col_name, info in _norm_fmts.items():
+        code = info["excel_code"]
+        explicit_id = info.get("numfmt_id")
+        code_key = code.lower()
+
+        if code_key not in _seen_codes:
+            # Determine numFmt ID
+            if explicit_id is not None and explicit_id < 164:
+                nfmt_id = explicit_id
+                is_builtin = True
+            elif code_key in _BUILTIN_CODE_TO_ID:
+                nfmt_id = _BUILTIN_CODE_TO_ID[code_key]
+                is_builtin = True
+            else:
+                nfmt_id = _custom_id_next
+                _custom_id_next += 1
+                is_builtin = False
+
+            style_idx = len(_style_list) + 1  # 1-based (0 = General)
+            _style_list.append({"excel_code": code, "numfmt_id": nfmt_id, "is_builtin": is_builtin})
+            _seen_codes[code_key] = {"style_idx": style_idx, "numfmt_id": nfmt_id}
+
+        _col_style[col_name] = str(_seen_codes[code_key]["style_idx"])
+
+    has_dates = bool(_style_list)
 
     # Build cell XML for each column using vectorized operations
     col_arrays = []
@@ -2661,7 +3185,7 @@ def _write_df_to_xlsx_vectorized(df, file_path, sheet_name="Sheet1", date_format
             serial = delta.dt.total_seconds() / 86400.0
             # Format as string (enough precision for time)
             serial_vals = serial.values
-            vals_str = np.where(mask, np.char.mod('%.10g', serial_vals), '')
+            vals_str = np.where(mask, np.char.mod('%.17g', serial_vals), '')
             # Build XML: <c r="A2" s="1"><v>45678.5</v></c>
             full = np.char.add(
                 np.char.add('<c r="', refs),
@@ -2740,26 +3264,34 @@ def _write_df_to_xlsx_vectorized(df, file_path, sheet_name="Sheet1", date_format
     # Build styles.xml if date columns exist
     styles_xml = None
     if has_dates:
-        # Build numFmts (custom format IDs start at 164)
+        # Build numFmts — only custom (non-built-in) formats need entries
+        custom_fmts = [s for s in _style_list if not s["is_builtin"]]
         numfmt_entries = ''.join(
-            f'<numFmt numFmtId="{164 + i}" formatCode="{fmt}"/>'
-            for i, fmt in enumerate(_unique_fmts)
+            '<numFmt numFmtId="{}" formatCode="{}"/>'.format(
+                s["numfmt_id"],
+                html_mod.escape(s["excel_code"], quote=True)
+            )
+            for s in custom_fmts
         )
         # Build cellXfs: style 0 = General, then one per date format
         xf_entries = '<xf numFmtId="0" fontId="0" fillId="0" borderId="0"/>'
-        for i, fmt in enumerate(_unique_fmts):
-            xf_entries += f'<xf numFmtId="{164 + i}" fontId="0" fillId="0" borderId="0" applyNumberFormat="1"/>'
+        for s in _style_list:
+            xf_entries += f'<xf numFmtId="{s["numfmt_id"]}" fontId="0" fillId="0" borderId="0" applyNumberFormat="1"/>'
 
+        numfmts_section = (
+            f'<numFmts count="{len(custom_fmts)}">{numfmt_entries}</numFmts>'
+            if custom_fmts else ''
+        )
         styles_xml = (
             '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
             '<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
-            f'<numFmts count="{len(_unique_fmts)}">{numfmt_entries}</numFmts>'
+            + numfmts_section +
             '<fonts count="1"><font><sz val="11"/><name val="Calibri"/></font></fonts>'
             '<fills count="2"><fill><patternFill patternType="none"/></fill>'
             '<fill><patternFill patternType="gray125"/></fill></fills>'
             '<borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders>'
             '<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>'
-            f'<cellXfs count="{1 + len(_unique_fmts)}">{xf_entries}</cellXfs>'
+            f'<cellXfs count="{1 + len(_style_list)}">{xf_entries}</cellXfs>'
             '</styleSheet>'
         )
 
@@ -2854,46 +3386,58 @@ def _cast_df_columns_to_detected_types(df, csv_types, fixed_col_indices):
 
         elif col_type == "date":
             # Convert text date strings to datetime for native Excel date storage
-            parse_fmt = _VECTORIZED_PARSE_FORMATS.get(col_fmt)
-            if not parse_fmt:
-                # Try without time suffix
-                parse_fmt = _VECTORIZED_PARSE_FORMATS.get(col_fmt.replace(" HH:MM:SS", ""))
+            # Try signature-based conversion first
+            col_sig = info.get("signature")
+            col_excel = info.get("excel_code", "")
 
-            if parse_fmt:
+            if isinstance(col_sig, DateSignature):
                 try:
-                    # Clean common artifacts before parsing
-                    series = df[col_name].copy()
-                    mask = series.notna() & (series.astype(str).str.strip() != "")
-                    if mask.any():
-                        clean = series[mask].astype(str).str.strip()
-                        # Normalize ISO-8601 variants: "2025-11-12T22:07Z" → "2025-11-12 22:07"
-                        if clean.str.contains('T', na=False).any():
-                            clean = clean.str.replace('T', ' ', regex=False)
-                            clean = clean.str.replace('Z', '', regex=False)
-                            # Remove timezone offset like +05:30 or -04:00
-                            clean = clean.str.replace(r'[+-]\d{2}:\d{2}$', '', regex=True)
-                        # Try with full format first (may include time)
-                        parsed = pd.to_datetime(clean, format=parse_fmt, errors="coerce")
-                        # Fallback: try without seconds if many NaT
-                        nat_count = parsed.isna().sum()
-                        if nat_count > len(parsed) * 0.5:
-                            nosec_fmt = _VECTORIZED_PARSE_FORMATS_NO_SEC.get(col_fmt)
-                            if nosec_fmt:
-                                parsed = pd.to_datetime(clean, format=nosec_fmt, errors="coerce")
-                        # Last fallback: let pandas infer (handles mixed formats)
-                        if parsed.isna().sum() > len(parsed) * 0.5:
-                            parsed = pd.to_datetime(clean, errors="coerce", dayfirst=col_fmt in _DAY_FIRST_LABELS)
-                        # Only convert if at least half parsed successfully
-                        if parsed.notna().sum() >= len(parsed) * 0.5:
-                            # Build full-length datetime column (NaT for empty/missing rows)
-                            full_dt = pd.Series(pd.NaT, index=df.index, dtype="datetime64[ns]")
-                            full_dt.iloc[mask.values.nonzero()[0]] = parsed.values
-                            df[col_name] = full_dt
-                            # Determine Excel format code
-                            excel_fmt = _DATE_FMT_LABEL_TO_EXCEL.get(col_fmt, "yyyy-mm-dd")
-                            date_fmt_map[col_name] = excel_fmt
+                    _convert_date_column(df, col_name, col_sig, col_sig, col_excel or "yyyy-mm-dd")
+                    date_fmt_map[col_name] = col_excel or _DATE_FMT_LABEL_TO_EXCEL.get(col_fmt, "yyyy-mm-dd")
                 except Exception:
                     pass  # Leave as string if conversion fails
+            else:
+                # Legacy label-based path
+                parse_fmt = _VECTORIZED_PARSE_FORMATS.get(col_fmt)
+                if not parse_fmt:
+                    # Try without time suffix
+                    parse_fmt = _VECTORIZED_PARSE_FORMATS.get(col_fmt.replace(" HH:MM:SS", ""))
+
+                if parse_fmt:
+                    try:
+                        # Clean common artifacts before parsing
+                        series = df[col_name].copy()
+                        mask = series.notna() & (series.astype(str).str.strip() != "")
+                        if mask.any():
+                            clean = series[mask].astype(str).str.strip()
+                            # Normalize ISO-8601 variants: "2025-11-12T22:07Z" → "2025-11-12 22:07"
+                            if clean.str.contains('T', na=False).any():
+                                clean = clean.str.replace('T', ' ', regex=False)
+                                clean = clean.str.replace('Z', '', regex=False)
+                                # Remove timezone offset like +05:30 or -04:00
+                                clean = clean.str.replace(r'[+-]\d{2}:\d{2}$', '', regex=True)
+                            # Try with full format first (may include time)
+                            parsed = pd.to_datetime(clean, format=parse_fmt, errors="coerce")
+                            # Fallback: try without seconds if many NaT
+                            nat_count = parsed.isna().sum()
+                            if nat_count > len(parsed) * 0.5:
+                                nosec_fmt = _VECTORIZED_PARSE_FORMATS_NO_SEC.get(col_fmt)
+                                if nosec_fmt:
+                                    parsed = pd.to_datetime(clean, format=nosec_fmt, errors="coerce")
+                            # Last fallback: let pandas infer (handles mixed formats)
+                            if parsed.isna().sum() > len(parsed) * 0.5:
+                                parsed = pd.to_datetime(clean, errors="coerce", dayfirst=col_fmt in _DAY_FIRST_LABELS)
+                            # Only convert if at least half parsed successfully
+                            if parsed.notna().sum() >= len(parsed) * 0.5:
+                                # Build full-length datetime column (NaT for empty/missing rows)
+                                full_dt = pd.Series(pd.NaT, index=df.index, dtype="datetime64[ns]")
+                                full_dt.iloc[mask.values.nonzero()[0]] = parsed.values
+                                df[col_name] = full_dt
+                                # Determine Excel format code
+                                excel_fmt = _DATE_FMT_LABEL_TO_EXCEL.get(col_fmt, "yyyy-mm-dd")
+                                date_fmt_map[col_name] = excel_fmt
+                    except Exception:
+                        pass  # Leave as string if conversion fails
 
     return df, date_fmt_map
 
@@ -3044,24 +3588,35 @@ def apply_fixes(findings, output_folder):
                         if col_idx < len(df.columns):
                             col_name = df.columns[col_idx]
                             if from_type == "date" and to_type == "date":
+                                # Try signature-based conversion first
+                                src_sig_dict = fix_data.get("source_signature")
+                                tgt_sig_dict = fix_data.get("target_signature")
+                                tgt_excel = fix_data.get("target_excel_code", "")
+                                src_sig = DateSignature(**src_sig_dict) if isinstance(src_sig_dict, dict) else None
+                                tgt_sig = DateSignature(**tgt_sig_dict) if isinstance(tgt_sig_dict, dict) else None
+
                                 if target_fmt == "General":
                                     # Template has native dates with "General" number_format.
                                     # Just parse to datetime — no reformatting needed.
-                                    # Excel will display using OS locale (matching template).
-                                    src_fmt = fix_data.get("source_format", "")
-                                    parse_fmt = _VECTORIZED_PARSE_FORMATS.get(src_fmt) or _DATE_FMT_LABEL_TO_STRFTIME.get(src_fmt, "%Y-%m-%d")
-                                    try:
-                                        df[col_name] = pd.to_datetime(df[col_name], format=parse_fmt, errors="coerce")
-                                        # No entry in _date_fmt_map → style 0 = General
-                                    except Exception:
-                                        pass
+                                    if src_sig:
+                                        _convert_date_column(df, col_name, src_sig, tgt_sig, "General")
+                                    else:
+                                        src_fmt = fix_data.get("source_format", "")
+                                        parse_fmt = _VECTORIZED_PARSE_FORMATS.get(src_fmt) or _DATE_FMT_LABEL_TO_STRFTIME.get(src_fmt, "%Y-%m-%d")
+                                        try:
+                                            df[col_name] = pd.to_datetime(df[col_name], format=parse_fmt, errors="coerce")
+                                        except Exception:
+                                            pass
+                                    # No entry in _date_fmt_map → style 0 = General
+                                elif src_sig and tgt_sig:
+                                    # Signature-based single-parse conversion
+                                    _convert_date_column(df, col_name, src_sig, tgt_sig, tgt_excel or "yyyy-mm-dd")
+                                    _date_fmt_map[col_name] = tgt_excel or _DATE_FMT_LABEL_TO_EXCEL.get(target_fmt, "yyyy-mm-dd")
                                 else:
+                                    # Legacy label-based path
                                     py_fmt = _DATE_FMT_LABEL_TO_STRFTIME.get(target_fmt, "%Y-%m-%d")
                                     src_fmt = fix_data.get("source_format", "")
                                     _vectorized_date_reformat(df, col_name, src_fmt, py_fmt)
-                                    # Convert reformatted strings to datetime for native Excel date storage
-                                    # Use the PARSE format (strptime-compatible, no %# Windows codes)
-                                    # because pd.to_datetime uses strptime, not strftime.
                                     parse_fmt = _VECTORIZED_PARSE_FORMATS.get(target_fmt, "%Y-%m-%d")
                                     try:
                                         df[col_name] = pd.to_datetime(df[col_name], format=parse_fmt, errors="coerce")
@@ -3071,19 +3626,30 @@ def apply_fixes(findings, output_folder):
                             elif to_type == "numeric":
                                 df[col_name] = pd.to_numeric(df[col_name], errors="coerce")
                             elif to_type == "date":
+                                # Try signature-based conversion first
+                                src_sig_dict = fix_data.get("source_signature")
+                                tgt_sig_dict = fix_data.get("target_signature")
+                                tgt_excel = fix_data.get("target_excel_code", "")
+                                src_sig = DateSignature(**src_sig_dict) if isinstance(src_sig_dict, dict) else None
+                                tgt_sig = DateSignature(**tgt_sig_dict) if isinstance(tgt_sig_dict, dict) else None
+
                                 if target_fmt == "General":
-                                    src_fmt = fix_data.get("source_format", "")
-                                    parse_fmt = _VECTORIZED_PARSE_FORMATS.get(src_fmt) or _DATE_FMT_LABEL_TO_STRFTIME.get(src_fmt, "%Y-%m-%d")
-                                    try:
-                                        df[col_name] = pd.to_datetime(df[col_name], format=parse_fmt, errors="coerce")
-                                    except Exception:
-                                        pass
+                                    if src_sig:
+                                        _convert_date_column(df, col_name, src_sig, tgt_sig, "General")
+                                    else:
+                                        src_fmt = fix_data.get("source_format", "")
+                                        parse_fmt = _VECTORIZED_PARSE_FORMATS.get(src_fmt) or _DATE_FMT_LABEL_TO_STRFTIME.get(src_fmt, "%Y-%m-%d")
+                                        try:
+                                            df[col_name] = pd.to_datetime(df[col_name], format=parse_fmt, errors="coerce")
+                                        except Exception:
+                                            pass
+                                elif src_sig and tgt_sig:
+                                    _convert_date_column(df, col_name, src_sig, tgt_sig, tgt_excel or "yyyy-mm-dd")
+                                    _date_fmt_map[col_name] = tgt_excel or _DATE_FMT_LABEL_TO_EXCEL.get(target_fmt, "yyyy-mm-dd")
                                 else:
                                     target_py_fmt = _DATE_FMT_LABEL_TO_STRFTIME.get(target_fmt, "%Y-%m-%d")
                                     src_fmt = fix_data.get("source_format", "")
                                     _vectorized_date_reformat(df, col_name, src_fmt, target_py_fmt)
-                                    # Convert to datetime for native Excel date storage
-                                    # Use the PARSE format (strptime-compatible, no %# Windows codes)
                                     parse_fmt = _VECTORIZED_PARSE_FORMATS.get(target_fmt, "%Y-%m-%d")
                                     try:
                                         df[col_name] = pd.to_datetime(df[col_name], format=parse_fmt, errors="coerce")
@@ -3270,17 +3836,32 @@ def apply_fixes(findings, output_folder):
                                 if col_idx < len(df.columns):
                                     col_name = df.columns[col_idx]
                                     if from_type == "date" and to_type == "date":
-                                        # Date format change (e.g. M/D/YYYY → YYYY-MM-DD)
-                                        # FAST vectorized approach: use pd.to_datetime with known format
-                                        py_fmt = _DATE_FMT_LABEL_TO_STRFTIME.get(target_fmt, "%Y-%m-%d")
-                                        src_fmt = fix_data.get("source_format", "")
-                                        _vectorized_date_reformat(df, col_name, src_fmt, py_fmt)
+                                        # Try signature-based single-parse conversion
+                                        src_sig_dict = fix_data.get("source_signature")
+                                        tgt_sig_dict = fix_data.get("target_signature")
+                                        tgt_excel = fix_data.get("target_excel_code", "")
+                                        src_sig = DateSignature(**src_sig_dict) if isinstance(src_sig_dict, dict) else None
+                                        tgt_sig = DateSignature(**tgt_sig_dict) if isinstance(tgt_sig_dict, dict) else None
+                                        if src_sig:
+                                            _convert_date_column(df, col_name, src_sig, tgt_sig, tgt_excel or "yyyy-mm-dd")
+                                        else:
+                                            py_fmt = _DATE_FMT_LABEL_TO_STRFTIME.get(target_fmt, "%Y-%m-%d")
+                                            src_fmt = fix_data.get("source_format", "")
+                                            _vectorized_date_reformat(df, col_name, src_fmt, py_fmt)
                                     elif to_type == "numeric":
                                         df[col_name] = pd.to_numeric(df[col_name], errors="coerce")
                                     elif to_type == "date":
-                                        target_py_fmt = _DATE_FMT_LABEL_TO_STRFTIME.get(target_fmt, "%Y-%m-%d")
-                                        src_fmt = fix_data.get("source_format", "")
-                                        _vectorized_date_reformat(df, col_name, src_fmt, target_py_fmt)
+                                        src_sig_dict = fix_data.get("source_signature")
+                                        tgt_sig_dict = fix_data.get("target_signature")
+                                        tgt_excel = fix_data.get("target_excel_code", "")
+                                        src_sig = DateSignature(**src_sig_dict) if isinstance(src_sig_dict, dict) else None
+                                        tgt_sig = DateSignature(**tgt_sig_dict) if isinstance(tgt_sig_dict, dict) else None
+                                        if src_sig:
+                                            _convert_date_column(df, col_name, src_sig, tgt_sig, tgt_excel or "yyyy-mm-dd")
+                                        else:
+                                            target_py_fmt = _DATE_FMT_LABEL_TO_STRFTIME.get(target_fmt, "%Y-%m-%d")
+                                            src_fmt = fix_data.get("source_format", "")
+                                            _vectorized_date_reformat(df, col_name, src_fmt, target_py_fmt)
                                     elif to_type == "text":
                                         df[col_name] = df[col_name].astype(str).replace("nan", "")
                                     csv_modified = True
