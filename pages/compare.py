@@ -3618,24 +3618,42 @@ def _get_config_path():
     (``study_config_<username>.json``) so studies are private.
     On desktop the single shared ``study_config.json`` is used.
 
-    One-time migration: the first user to log in after this update gets the
-    old shared ``study_config.json`` **moved** into their personal file so
-    their existing studies are preserved.  The shared file is removed so no
-    subsequent user inherits it.
+    One-time migration (server only):
+      1. If the old shared config exists in the writable dir → move it.
+      2. Otherwise, if the *bundled* ``study_config.json`` in the app dir
+         has not been claimed yet (no ``.study_config_migrated`` marker),
+         copy it to the first user's personal file and drop the marker so
+         no subsequent user inherits it.
     """
     if IS_SERVER:
         username = _get_current_user()
         safe_user = re.sub(r'[^\w\-.]', '_', username)
         user_cfg = os.path.join(_CFG_DIR, f"study_config_{safe_user}.json")
-        # One-time migration: move old shared config → first user's personal file
+        # One-time migration: seed the first user's personal file from
+        # the old shared config (writable dir) or the bundled app copy.
         if not os.path.exists(user_cfg):
             _old_shared = os.path.join(_CFG_DIR, "study_config.json")
+            _migrated_marker = os.path.join(_CFG_DIR, ".study_config_migrated")
             if os.path.exists(_old_shared):
+                # Old shared config in writable dir — move it
                 try:
                     os.rename(_old_shared, user_cfg)
                 except OSError:
                     import shutil
                     shutil.move(_old_shared, user_cfg)
+            elif not os.path.exists(_migrated_marker):
+                # First deploy: copy bundled config from app dir (read-only)
+                _bundled = os.path.join(_APP_DIR, "study_config.json")
+                if os.path.exists(_bundled):
+                    import shutil
+                    shutil.copy2(_bundled, user_cfg)
+            # Drop marker so no other user inherits the bundled studies
+            if not os.path.exists(_migrated_marker):
+                try:
+                    with open(_migrated_marker, "w") as _mf:
+                        _mf.write(username)
+                except OSError:
+                    pass
         return user_cfg
     return _DESKTOP_CONFIG
 
