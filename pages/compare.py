@@ -732,6 +732,7 @@ def detect_column_types(file_path, sheet_name, hdr_row, max_sample=15):
                 continue
 
             date_count = num_count = text_count = 0
+            general_date_count = 0  # native dates with "General" number_format
             fmt = "General"
             detected_formats = []
 
@@ -778,6 +779,7 @@ def detect_column_types(file_path, sheet_name, hdr_row, max_sample=15):
                             else:
                                 detected_formats.append("YYYY-MM-DD")
                     else:
+                        general_date_count += 1
                         if isinstance(val, datetime.datetime) and (val.hour or val.minute or val.second):
                             detected_formats.append("YYYY-MM-DD HH:MM:SS")
                         else:
@@ -791,6 +793,7 @@ def detect_column_types(file_path, sheet_name, hdr_row, max_sample=15):
                         else:
                             detected_formats.append("YYYY-MM-DD")
                     else:
+                        general_date_count += 1
                         detected_formats.append("YYYY-MM-DD")
                 elif cell_dtype == "n":
                     # Numeric — but check if it's a date stored as serial number
@@ -838,9 +841,13 @@ def detect_column_types(file_path, sheet_name, hdr_row, max_sample=15):
                     fmt = _EXCEL_FMT_TO_LABEL.get(fmt.lower(), fmt)
                 # Format consistency tracking
                 consistency = fmt_counts.most_common(1)[0][1] / len(detected_formats) if detected_formats else 0.0
+                # Flag columns where most date cells had "General" number_format
+                # (display depends on OS locale, not an explicit Excel format code)
+                is_general = general_date_count > 0 and general_date_count >= date_count / 2
                 types[col_i] = {"header": str(hdr_val).strip(), "type": dtype_result, "format": fmt,
                                 "format_consistency": round(consistency, 2),
-                                "format_variants": len(fmt_counts)}
+                                "format_variants": len(fmt_counts),
+                                "general_date": is_general}
             elif dtype_result != "date":
                 fmt = "General"
                 types[col_i] = {"header": str(hdr_val).strip(), "type": dtype_result, "format": fmt}
@@ -1391,6 +1398,7 @@ def _detect_types_uncached(file_path, sheet_name, hdr_row, max_sample=15):
                 continue
 
             date_count = num_count = text_count = 0
+            general_date_count = 0  # native dates with "General" number_format
             fmt = "General"
             detected_formats = []
 
@@ -1802,11 +1810,17 @@ def _deeper_analysis(findings, placed_path, template_path, placed_name,
                     p_storage != t_storage):
                     p_label = "Character (text)" if p_storage == "text_date" else "Numeric (native date)"
                     t_label = "Character (text)" if t_storage == "text_date" else "Numeric (native date)"
-                    # For the output format, prefer the text side's format (accurately
-                    # detected from actual values via regex) over the native side's
-                    # format which may be a "YYYY-MM-DD" fallback when the Excel
-                    # number_format is "General".
-                    if p_storage == "text_date" and p_fmt and p_fmt != "YYYY-MM-DD":
+                    # When the template has native dates with "General" number_format
+                    # (display depends on OS locale), the fix should convert the
+                    # source text to native dates with "General" format so they
+                    # display identically to the template.
+                    t_is_general = t_info.get("general_date", False)
+                    p_is_general = p_info.get("general_date", False)
+                    if t_storage == "native_date" and t_is_general:
+                        effective_target_fmt = "General"
+                    elif p_storage == "native_date" and p_is_general:
+                        effective_target_fmt = "General"
+                    elif p_storage == "text_date" and p_fmt and p_fmt != "YYYY-MM-DD":
                         effective_target_fmt = p_fmt
                     elif t_storage == "text_date" and t_fmt and t_fmt != "YYYY-MM-DD":
                         effective_target_fmt = t_fmt
@@ -2621,7 +2635,7 @@ def _write_df_to_xlsx_vectorized(df, file_path, sheet_name="Sheet1", date_format
             col_arrays.append(arr)
         elif hasattr(dtype, 'kind') and dtype.kind == 'M':
             # Datetime64 column: convert to Excel serial number with style reference
-            style_idx = _col_style.get(col_name, '1')
+            style_idx = _col_style.get(col_name, '0')
             mask = col.notna().values
             # Excel epoch: 1899-12-30 (Excel's day-0 is 1900-01-00 which is 1899-12-30)
             excel_epoch = pd.Timestamp('1899-12-30')
@@ -3013,32 +3027,52 @@ def apply_fixes(findings, output_folder):
                         if col_idx < len(df.columns):
                             col_name = df.columns[col_idx]
                             if from_type == "date" and to_type == "date":
-                                py_fmt = _DATE_FMT_LABEL_TO_STRFTIME.get(target_fmt, "%Y-%m-%d")
-                                src_fmt = fix_data.get("source_format", "")
-                                _vectorized_date_reformat(df, col_name, src_fmt, py_fmt)
-                                # Convert reformatted strings to datetime for native Excel date storage
-                                # Use the PARSE format (strptime-compatible, no %# Windows codes)
-                                # because pd.to_datetime uses strptime, not strftime.
-                                parse_fmt = _VECTORIZED_PARSE_FORMATS.get(target_fmt, "%Y-%m-%d")
-                                try:
-                                    df[col_name] = pd.to_datetime(df[col_name], format=parse_fmt, errors="coerce")
-                                    _date_fmt_map[col_name] = _DATE_FMT_LABEL_TO_EXCEL.get(target_fmt, "yyyy-mm-dd")
-                                except Exception:
-                                    pass  # Leave as string if conversion fails
+                                if target_fmt == "General":
+                                    # Template has native dates with "General" number_format.
+                                    # Just parse to datetime — no reformatting needed.
+                                    # Excel will display using OS locale (matching template).
+                                    src_fmt = fix_data.get("source_format", "")
+                                    parse_fmt = _VECTORIZED_PARSE_FORMATS.get(src_fmt) or _DATE_FMT_LABEL_TO_STRFTIME.get(src_fmt, "%Y-%m-%d")
+                                    try:
+                                        df[col_name] = pd.to_datetime(df[col_name], format=parse_fmt, errors="coerce")
+                                        # No entry in _date_fmt_map → style 0 = General
+                                    except Exception:
+                                        pass
+                                else:
+                                    py_fmt = _DATE_FMT_LABEL_TO_STRFTIME.get(target_fmt, "%Y-%m-%d")
+                                    src_fmt = fix_data.get("source_format", "")
+                                    _vectorized_date_reformat(df, col_name, src_fmt, py_fmt)
+                                    # Convert reformatted strings to datetime for native Excel date storage
+                                    # Use the PARSE format (strptime-compatible, no %# Windows codes)
+                                    # because pd.to_datetime uses strptime, not strftime.
+                                    parse_fmt = _VECTORIZED_PARSE_FORMATS.get(target_fmt, "%Y-%m-%d")
+                                    try:
+                                        df[col_name] = pd.to_datetime(df[col_name], format=parse_fmt, errors="coerce")
+                                        _date_fmt_map[col_name] = _DATE_FMT_LABEL_TO_EXCEL.get(target_fmt, "yyyy-mm-dd")
+                                    except Exception:
+                                        pass  # Leave as string if conversion fails
                             elif to_type == "numeric":
                                 df[col_name] = pd.to_numeric(df[col_name], errors="coerce")
                             elif to_type == "date":
-                                target_py_fmt = _DATE_FMT_LABEL_TO_STRFTIME.get(target_fmt, "%Y-%m-%d")
-                                src_fmt = fix_data.get("source_format", "")
-                                _vectorized_date_reformat(df, col_name, src_fmt, target_py_fmt)
-                                # Convert to datetime for native Excel date storage
-                                # Use the PARSE format (strptime-compatible, no %# Windows codes)
-                                parse_fmt = _VECTORIZED_PARSE_FORMATS.get(target_fmt, "%Y-%m-%d")
-                                try:
-                                    df[col_name] = pd.to_datetime(df[col_name], format=parse_fmt, errors="coerce")
-                                    _date_fmt_map[col_name] = _DATE_FMT_LABEL_TO_EXCEL.get(target_fmt, "yyyy-mm-dd")
-                                except Exception:
-                                    pass
+                                if target_fmt == "General":
+                                    src_fmt = fix_data.get("source_format", "")
+                                    parse_fmt = _VECTORIZED_PARSE_FORMATS.get(src_fmt) or _DATE_FMT_LABEL_TO_STRFTIME.get(src_fmt, "%Y-%m-%d")
+                                    try:
+                                        df[col_name] = pd.to_datetime(df[col_name], format=parse_fmt, errors="coerce")
+                                    except Exception:
+                                        pass
+                                else:
+                                    target_py_fmt = _DATE_FMT_LABEL_TO_STRFTIME.get(target_fmt, "%Y-%m-%d")
+                                    src_fmt = fix_data.get("source_format", "")
+                                    _vectorized_date_reformat(df, col_name, src_fmt, target_py_fmt)
+                                    # Convert to datetime for native Excel date storage
+                                    # Use the PARSE format (strptime-compatible, no %# Windows codes)
+                                    parse_fmt = _VECTORIZED_PARSE_FORMATS.get(target_fmt, "%Y-%m-%d")
+                                    try:
+                                        df[col_name] = pd.to_datetime(df[col_name], format=parse_fmt, errors="coerce")
+                                        _date_fmt_map[col_name] = _DATE_FMT_LABEL_TO_EXCEL.get(target_fmt, "yyyy-mm-dd")
+                                    except Exception:
+                                        pass
                             elif to_type == "text":
                                 df[col_name] = df[col_name].astype(str).replace("nan", "")
                             _fixed_col_names.add(str(col_name).strip().lower())
