@@ -3580,34 +3580,85 @@ import json
 # then a /tmp fallback on the server, then the app dir (desktop).
 _APP_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if IS_SERVER:
-    _cfg_dir = os.environ.get("RSTUDIO_CONNECT_STORAGE") or os.path.join(
+    _CFG_DIR = os.environ.get("RSTUDIO_CONNECT_STORAGE") or os.path.join(
         os.environ.get("TMPDIR", "/tmp"), "ifv_config"
     )
-    os.makedirs(_cfg_dir, exist_ok=True)
-    CONFIG_FILE = os.path.join(_cfg_dir, "study_config.json")
-    # Seed from bundled copy on first run
-    _bundled = os.path.join(_APP_DIR, "study_config.json")
-    if not os.path.exists(CONFIG_FILE) and os.path.exists(_bundled):
-        import shutil
-        shutil.copy2(_bundled, CONFIG_FILE)
+    os.makedirs(_CFG_DIR, exist_ok=True)
 else:
-    CONFIG_FILE = os.path.join(_APP_DIR, "study_config.json")
+    _CFG_DIR = _APP_DIR
+
+_DESKTOP_CONFIG = os.path.join(_APP_DIR, "study_config.json")
+
+
+def _get_current_user():
+    """Get the current username.
+
+    On Posit Connect the ``Rstudio-Connect-Credentials`` request header
+    contains a JSON object with a ``user`` field (the Connect username).
+    On desktop we fall back to the OS username.
+    """
+    if IS_SERVER:
+        try:
+            creds = st.context.headers.get("Rstudio-Connect-Credentials", "")
+            if creds:
+                user_info = json.loads(creds)
+                username = user_info.get("user", "")
+                if username:
+                    return username
+        except Exception:
+            pass
+    # Desktop fallback — OS username
+    return os.environ.get("USER") or os.environ.get("USERNAME") or "default"
+
+
+def _get_config_path():
+    """Return the study-config file path for the current user.
+
+    On Posit Connect each user gets their own file
+    (``study_config_<username>.json``) so studies are private.
+    On desktop the single shared ``study_config.json`` is used.
+
+    One-time migration: the first user to log in after this update gets the
+    old shared ``study_config.json`` **moved** into their personal file so
+    their existing studies are preserved.  The shared file is removed so no
+    subsequent user inherits it.
+    """
+    if IS_SERVER:
+        username = _get_current_user()
+        safe_user = re.sub(r'[^\w\-.]', '_', username)
+        user_cfg = os.path.join(_CFG_DIR, f"study_config_{safe_user}.json")
+        # One-time migration: move old shared config → first user's personal file
+        if not os.path.exists(user_cfg):
+            _old_shared = os.path.join(_CFG_DIR, "study_config.json")
+            if os.path.exists(_old_shared):
+                try:
+                    os.rename(_old_shared, user_cfg)
+                except OSError:
+                    import shutil
+                    shutil.move(_old_shared, user_cfg)
+        return user_cfg
+    return _DESKTOP_CONFIG
 
 
 def load_study_config():
-    """Load study configuration from JSON file."""
-    if os.path.exists(CONFIG_FILE):
+    """Load study configuration from the current user's JSON file."""
+    cfg_path = _get_config_path()
+    if os.path.exists(cfg_path):
         try:
-            with open(CONFIG_FILE, "r") as f:
-                return json.load(f)
+            with open(cfg_path, "r") as f:
+                data = json.load(f)
+            # Strip metadata keys that are not real studies
+            data.pop("_comment", None)
+            return data
         except Exception:
             pass
     return {}
 
 
 def save_study_config(config):
-    """Save study configuration to JSON file."""
-    with open(CONFIG_FILE, "w") as f:
+    """Save study configuration to the current user's JSON file."""
+    cfg_path = _get_config_path()
+    with open(cfg_path, "w") as f:
         json.dump(config, f, indent=2)
 
 
