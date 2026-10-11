@@ -1860,6 +1860,17 @@ def _deeper_analysis(findings, placed_path, template_path, placed_name,
                 # reference and holds different data, so row-by-row comparison
                 # would always produce false positives.
 
+                # When the template has native dates with "General" number_format
+                # (display depends on OS locale), the detected format is just
+                # a "YYYY-MM-DD" fallback — not the real display format.
+                # Comparing against this fallback produces false/inverted
+                # findings, so skip the format comparison.  The CSV dates will
+                # be converted to native dates with "General" format during
+                # output, matching the template's locale-dependent display.
+                t_is_general = t_info.get("general_date", False)
+                if t_is_general:
+                    continue  # Can't determine template display format → no finding
+
                 # --- Canonical signature comparison ---
                 # Derives structural fingerprint: component order + delimiter.
                 # Time precision (HH:MM vs HH:MM:SS, or time present vs absent)
