@@ -3650,7 +3650,16 @@ def _get_current_user():
     """
     if IS_SERVER:
         try:
-            creds = st.context.headers.get("Rstudio-Connect-Credentials", "")
+            headers = st.context.headers
+            # Try common header casings (HTTP headers are case-insensitive
+            # but Python dict access may not be)
+            creds = ""
+            for key in ("Rstudio-Connect-Credentials",
+                        "rstudio-connect-credentials",
+                        "RSTUDIO-CONNECT-CREDENTIALS"):
+                creds = headers.get(key, "")
+                if creds:
+                    break
             if creds:
                 user_info = json.loads(creds)
                 username = user_info.get("user", "")
@@ -3712,23 +3721,30 @@ def _get_config_path():
 def load_study_config():
     """Load study configuration from the current user's JSON file."""
     cfg_path = _get_config_path()
+    print(f"[study_config] LOAD from: {cfg_path}  exists={os.path.exists(cfg_path)}")
     if os.path.exists(cfg_path):
         try:
             with open(cfg_path, "r") as f:
                 data = json.load(f)
             # Strip metadata keys that are not real studies
             data.pop("_comment", None)
+            print(f"[study_config] LOAD OK: {list(data.keys())}")
             return data
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[study_config] LOAD ERROR: {e}")
     return {}
 
 
 def save_study_config(config):
     """Save study configuration to the current user's JSON file."""
     cfg_path = _get_config_path()
-    with open(cfg_path, "w") as f:
-        json.dump(config, f, indent=2)
+    print(f"[study_config] SAVE to: {cfg_path}  studies={list(config.keys())}")
+    try:
+        with open(cfg_path, "w") as f:
+            json.dump(config, f, indent=2)
+        print(f"[study_config] SAVE OK")
+    except Exception as e:
+        print(f"[study_config] SAVE ERROR: {e}")
 
 
 def extract_study_name(filenames):
