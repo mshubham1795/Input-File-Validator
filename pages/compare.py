@@ -1805,7 +1805,13 @@ def _deeper_analysis(findings, placed_path, template_path, placed_name,
                     template_path, template_sheet, tpl_hdr_row, tpl_col_actual, is_template_csv)
 
                 # Storage mismatch → report as Data Type issue
-                if (p_storage in ("text_date", "native_date") and
+                # BUT: skip this for CSV source files — CSV always stores dates
+                # as text, so text_date vs native_date is expected and not a real
+                # finding.  Fall through to the format comparison instead, which
+                # will detect actual date format differences (e.g. YYYY-MM-DD vs
+                # M/D/YYYY) and fix them while also converting to native dates.
+                if (not is_placed_csv and
+                    p_storage in ("text_date", "native_date") and
                     t_storage in ("text_date", "native_date") and
                     p_storage != t_storage):
                     p_label = "Character (text)" if p_storage == "text_date" else "Numeric (native date)"
