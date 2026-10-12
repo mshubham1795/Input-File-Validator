@@ -51,6 +51,92 @@ _BUILTIN_CODE_TO_ID = {v.lower(): k for k, v in _BUILTIN_NUMFMT_CODES.items()}
 
 
 # ---------------------------------------------------------------------------
+# System locale short-date detection (used when Excel stores dates as General)
+# ---------------------------------------------------------------------------
+@functools.lru_cache(maxsize=1)
+def _get_system_short_date_label():
+    """Detect the OS short-date format and return our internal label.
+
+    When Excel stores a date with number_format "General", it displays using
+    the system short-date format (locale-dependent).  We detect that here so
+    we don't incorrectly default to YYYY-MM-DD.
+
+    Returns a label like "M/D/YYYY", "DD/MM/YYYY", etc.
+    Falls back to "M/D/YYYY" if detection fails.
+    """
+    win_fmt = None
+    if os.name == "nt":
+        try:
+            import ctypes
+            buf = ctypes.create_unicode_buffer(80)
+            # LOCALE_USER_DEFAULT=0x0400, LOCALE_SSHORTDATE=0x1F
+            if ctypes.windll.kernel32.GetLocaleInfoW(0x0400, 0x1F, buf, 80):
+                win_fmt = buf.value  # e.g. "M/d/yyyy", "dd/MM/yyyy"
+        except Exception:
+            pass
+    if not win_fmt:
+        try:
+            import locale
+            # D_FMT gives the locale short date, e.g. "%m/%d/%Y"
+            loc_fmt = locale.nl_langinfo(locale.D_FMT)
+            # Convert strftime → our label
+            _strftime_to_label = {
+                "%m/%d/%Y": "M/D/YYYY", "%d/%m/%Y": "DD/MM/YYYY",
+                "%Y-%m-%d": "YYYY-MM-DD", "%d-%m-%Y": "DD-MM-YYYY",
+                "%m-%d-%Y": "MM-DD-YYYY", "%Y/%m/%d": "YYYY/MM/DD",
+            }
+            label = _strftime_to_label.get(loc_fmt)
+            if label:
+                return label
+        except Exception:
+            pass
+
+    if win_fmt:
+        # Map Windows format placeholders to our label.
+        # Windows uses: M/d/yyyy, MM/dd/yyyy, d/M/yyyy, dd/MM/yyyy,
+        #               yyyy-MM-dd, yyyy/MM/dd, etc.
+        wf = win_fmt.strip()
+        # Detect separator
+        sep = "/"
+        for ch in wf:
+            if ch in "/-. ":
+                sep = ch
+                break
+        # Detect component order by scanning for first d/M/y
+        order_chars = []
+        i = 0
+        while i < len(wf):
+            c = wf[i].lower()
+            if c == 'd' and 'D' not in order_chars:
+                order_chars.append('D')
+            elif c == 'm' and 'M' not in order_chars:
+                order_chars.append('M')
+            elif c == 'y' and 'Y' not in order_chars:
+                order_chars.append('Y')
+            i += 1
+        order_str = ''.join(order_chars)
+
+        _win_order_to_label = {
+            "MDY": f"M{sep}D{sep}YYYY",
+            "DMY": f"DD{sep}MM{sep}YYYY",
+            "YMD": f"YYYY{sep}MM{sep}DD",
+        }
+        label = _win_order_to_label.get(order_str)
+        if label and label in _DATE_FMT_LABEL_TO_EXCEL or label in (
+            "M/D/YYYY", "DD/MM/YYYY", "YYYY-MM-DD", "DD-MM-YYYY",
+            "MM-DD-YYYY", "YYYY/MM/DD", "DD.MM.YYYY", "MM/DD/YYYY",
+        ):
+            return label
+        # If label was generated but not in our known set, still return it
+        # if it looks reasonable
+        if label:
+            return label
+
+    # Safe fallback — US locale
+    return "M/D/YYYY"
+
+
+# ---------------------------------------------------------------------------
 # DateSignature — frozen dataclass replacing the old label system
 # ---------------------------------------------------------------------------
 @dataclasses.dataclass(frozen=True)
@@ -657,6 +743,20 @@ _EXCEL_FMT_TO_LABEL.update({
     "dd/mm/yyyy hh:mm": "DD/MM/YYYY HH:MM:SS",
     "dd/mm/yyyy h:mm": "DD/MM/YYYY HH:MM:SS",
     "dd-mmm-yy": "DD-MMM-YYYY",
+    # Built-in numFmtId 14 → "mm-dd-yy" (openpyxl resolves it this way)
+    "mm-dd-yy": "M/D/YYYY",
+    "mm-dd-yy h:mm": "M/D/YYYY HH:MM:SS",
+    "mm-dd-yy hh:mm": "M/D/YYYY HH:MM:SS",
+    "mm-dd-yy h:mm:ss": "M/D/YYYY HH:MM:SS",
+    "mm-dd-yy hh:mm:ss": "M/D/YYYY HH:MM:SS",
+    "m-d-yy": "M/D/YYYY",
+    "m-d-yyyy": "M/D/YYYY",
+    "m-d-yyyy h:mm": "M/D/YYYY HH:MM:SS",
+    "m-d-yyyy hh:mm:ss": "M/D/YYYY HH:MM:SS",
+    "dd-mm-yy": "DD-MM-YYYY",
+    "dd-mm-yy h:mm": "DD-MM-YYYY HH:MM:SS",
+    "dd-mm-yy hh:mm": "DD-MM-YYYY HH:MM:SS",
+    "d-m-yy": "DD-MM-YYYY",
     "[$-en-us]m/d/yyyy": "M/D/YYYY",
     "[$-en-us]mm/dd/yyyy": "M/D/YYYY",
     "[$-en-us]m/d/yy h:mm": "M/D/YYYY HH:MM:SS",
@@ -1293,6 +1393,14 @@ def detect_column_types(file_path, sheet_name, hdr_row, max_sample=15):
             detected_formats = []
 
             raw_excel_codes = []  # track raw Excel codes for signature computation
+            # When number_format is "General", Excel displays dates using the
+            # OS locale short-date format — detect it instead of defaulting to
+            # YYYY-MM-DD (which would be wrong on e.g. US-locale systems).
+            _locale_date_label = _get_system_short_date_label()
+            _locale_date_label_ts = _locale_date_label + " HH:MM:SS"
+            if _locale_date_label_ts not in _TEXT_DATE_LABELS:
+                _locale_date_label_ts = "M/D/YYYY HH:MM:SS"
+
             for s in col_samples:
                 val = s["value"]
                 nfmt = s["format"]
@@ -1320,9 +1428,29 @@ def detect_column_types(file_path, sheet_name, hdr_row, max_sample=15):
                     # Strip escaped chars (backslash before separators)
                     stripped3 = stripped2.replace("\\-", "-").replace("\\/", "/").replace("\\.", ".")
                     result = _EXCEL_FMT_TO_LABEL.get(stripped3)
-                    return result
+                    if result:
+                        return result
+                    # Last resort: parse with signature engine and map back to label
+                    sig = _excel_code_to_signature(raw_fmt)
+                    if sig is not None:
+                        ec = _signature_to_excel_code(sig)
+                        result = _EXCEL_FMT_TO_LABEL.get(ec)
+                        if result:
+                            return result
+                        # Build label from signature order/sep
+                        _order_to_lbl = {
+                            ("MDY", "/"): "M/D/YYYY", ("MDY", "-"): "MM-DD-YYYY",
+                            ("DMY", "/"): "DD/MM/YYYY", ("DMY", "-"): "DD-MM-YYYY",
+                            ("DMY", "."): "DD.MM.YYYY",
+                            ("YMD", "-"): "YYYY-MM-DD", ("YMD", "/"): "YYYY/MM/DD",
+                            ("YMD", "."): "YYYY.MM.DD",
+                        }
+                        base = _order_to_lbl.get((sig.order, sig.sep))
+                        if base and sig.has_time:
+                            return base + " HH:MM:SS"
+                        return base
+                    return None
 
-                # Check Python type FIRST — most reliable indicator regardless of cell_dtype
                 if isinstance(val, (datetime.datetime, datetime.date)):
                     date_count += 1
                     if nfmt and nfmt != "General":
@@ -1332,15 +1460,15 @@ def detect_column_types(file_path, sheet_name, hdr_row, max_sample=15):
                         else:
                             # Fallback: check if it's a datetime (has time) vs date-only
                             if isinstance(val, datetime.datetime) and (val.hour or val.minute or val.second):
-                                detected_formats.append("YYYY-MM-DD HH:MM:SS")
+                                detected_formats.append(_locale_date_label_ts)
                             else:
-                                detected_formats.append("YYYY-MM-DD")
+                                detected_formats.append(_locale_date_label)
                     else:
                         general_date_count += 1
                         if isinstance(val, datetime.datetime) and (val.hour or val.minute or val.second):
-                            detected_formats.append("YYYY-MM-DD HH:MM:SS")
+                            detected_formats.append(_locale_date_label_ts)
                         else:
-                            detected_formats.append("YYYY-MM-DD")
+                            detected_formats.append(_locale_date_label)
                 elif cell_dtype == "d":
                     date_count += 1
                     if nfmt and nfmt != "General":
@@ -1348,10 +1476,10 @@ def detect_column_types(file_path, sheet_name, hdr_row, max_sample=15):
                         if normalized:
                             detected_formats.append(normalized)
                         else:
-                            detected_formats.append("YYYY-MM-DD")
+                            detected_formats.append(_locale_date_label)
                     else:
                         general_date_count += 1
-                        detected_formats.append("YYYY-MM-DD")
+                        detected_formats.append(_locale_date_label)
                 elif cell_dtype == "n":
                     # Numeric — but check if it's a date stored as serial number
                     if nfmt and any(x in nfmt.lower() for x in ["yy", "mm", "dd", "m/d", "d-", "d/", "mmm"]):
