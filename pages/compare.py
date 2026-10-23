@@ -4986,25 +4986,35 @@ if st.session_state.get("cmp_done") and _can_place and _comparison_ran:
                             # Build case-insensitive lookup: lowercase → actual name on disk
                             _src_lookup = {name.lower(): name for name in src_files_on_disk}
 
+                            def _copy(src_file, dst_file):
+                                # Copy content first; metadata copy is best-effort. On shared
+                                # folders, os.utime/chmod on a pre-existing file owned by another
+                                # user raises PermissionError even though the content was written.
+                                shutil.copyfile(src_file, dst_file)
+                                try:
+                                    shutil.copystat(src_file, dst_file)
+                                except OSError as e:
+                                    print(f"[place_files] copystat skipped for {os.path.basename(dst_file)}: {type(e).__name__}: {e}")
+
                             def _find_and_copy(f):
                                 dst_file = os.path.join(out_folder, f)
                                 # Case-insensitive file lookup
                                 actual_name = _src_lookup.get(f.lower())
                                 if actual_name:
-                                    shutil.copy2(os.path.join(src, actual_name), dst_file)
+                                    _copy(os.path.join(src, actual_name), dst_file)
                                     return (f, None)
                                 # Check rename_map: file may have been renamed by Fix All
                                 for old_name, new_name in rename_map.items():
                                     if new_name.lower() == f.lower():
                                         actual = _src_lookup.get(new_name.lower())
                                         if actual:
-                                            shutil.copy2(os.path.join(src, actual), dst_file)
+                                            _copy(os.path.join(src, actual), dst_file)
                                             return (f, None)
                                     if old_name.lower() == f.lower():
                                         actual = _src_lookup.get(new_name.lower())
                                         if actual:
                                             alt_dst = os.path.join(out_folder, new_name)
-                                            shutil.copy2(os.path.join(src, actual), alt_dst)
+                                            _copy(os.path.join(src, actual), alt_dst)
                                             return (new_name, None)
                                 # Fallback: try alternate extensions
                                 stem = Path(f).stem.lower()
@@ -5013,9 +5023,10 @@ if st.session_state.get("cmp_done") and _can_place and _comparison_ran:
                                     actual = _src_lookup.get(alt_key)
                                     if actual:
                                         alt_dst = os.path.join(out_folder, actual)
-                                        shutil.copy2(os.path.join(src, actual), alt_dst)
+                                        _copy(os.path.join(src, actual), alt_dst)
                                         return (actual, None)
-                                return (None, f)
+                                print(f"[place_files] not found in source: {f} | src={src} | on_disk={src_files_on_disk}")
+                                return (None, f"{f} (not found in source folder)")
 
                             # Progress bar below the button
                             _prog = st.progress(0, text="Placing files...")
@@ -5029,8 +5040,9 @@ if st.session_state.get("cmp_done") and _can_place and _comparison_ran:
                                             placed.append(ok)
                                         elif fail:
                                             failed.append(fail)
-                                    except Exception:
-                                        failed.append(futs[fut])
+                                    except Exception as e:
+                                        print(f"[place_files] copy failed for {futs[fut]}: {type(e).__name__}: {e}")
+                                        failed.append(f"{futs[fut]} ({type(e).__name__}: {e})")
                                     _prog.progress(int(i / total * 100), text=f"Placing files... ({i}/{total})")
                             _prog.empty()
 
