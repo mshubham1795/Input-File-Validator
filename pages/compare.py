@@ -4340,10 +4340,14 @@ import json
 # then a /tmp fallback on the server, then the app dir (desktop).
 _APP_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if IS_SERVER:
-    _CFG_DIR = os.environ.get("RSTUDIO_CONNECT_STORAGE") or os.path.join(
-        os.environ.get("TMPDIR", "/tmp"), "ifv_config"
-    )
+    # IFV_CONFIG_DIR lets admins point at a persistent folder (e.g. a shared
+    # mount). TMPDIR on Posit Connect is per-process and wiped on restart, so
+    # studies saved there are lost when a new worker process starts.
+    _CFG_DIR = (os.environ.get("IFV_CONFIG_DIR")
+                or os.environ.get("RSTUDIO_CONNECT_STORAGE")
+                or os.path.join(os.environ.get("TMPDIR", "/tmp"), "ifv_config"))
     os.makedirs(_CFG_DIR, exist_ok=True)
+    print(f"[study_config] config dir: {_CFG_DIR}")
 else:
     _CFG_DIR = _APP_DIR
 
@@ -4445,15 +4449,21 @@ def load_study_config():
 
 
 def save_study_config(config):
-    """Save study configuration to the current user's JSON file."""
+    """Save study configuration to the current user's JSON file.
+
+    Returns ``None`` on success, or the error message on failure.
+    """
     cfg_path = _get_config_path()
     print(f"[study_config] SAVE to: {cfg_path}  studies={list(config.keys())}")
     try:
+        os.makedirs(os.path.dirname(cfg_path), exist_ok=True)
         with open(cfg_path, "w") as f:
             json.dump(config, f, indent=2)
         print(f"[study_config] SAVE OK")
+        return None
     except Exception as e:
         print(f"[study_config] SAVE ERROR: {e}")
+        return str(e)
 
 
 def extract_study_name(filenames):
@@ -4615,6 +4625,11 @@ if st.session_state.get("cmp_done") and st.session_state.get("cmp_selected"):
             dropdown_options = all_studies + ["+ New Study (browse manually)"]
             default_idx = len(dropdown_options) - 1
 
+        # A study was just saved — select it (must happen before the selectbox renders)
+        _pending_study = st.session_state.pop("_cmp_pending_study_select", None)
+        if _pending_study in dropdown_options:
+            st.session_state["cmp_study_select"] = _pending_study
+
         # Ensure session state value is valid for current options list
         current_ss_val = st.session_state.get("cmp_study_select")
         if current_ss_val is None or current_ss_val not in dropdown_options:
@@ -4629,6 +4644,9 @@ if st.session_state.get("cmp_done") and st.session_state.get("cmp_selected"):
                 key="cmp_study_select",
             )
         is_new_study = not (selected_option and selected_option != "+ New Study (browse manually)" and selected_option in config)
+        _save_msg = st.session_state.pop("_cmp_study_save_msg", None)
+        if _save_msg:
+            (st.success if _save_msg[0] == "success" else st.error)(_save_msg[1])
         if is_new_study:
             with _study_col2:
                 study_name = st.text_input("Study Name", value=detected_study, key="cmp_study_name_input",
@@ -4722,14 +4740,23 @@ if st.session_state.get("cmp_done") and st.session_state.get("cmp_selected"):
 
             # Save & Compare button
             if main_folder:
-                if st.button("Save & compare", type="primary", key="cmp_save_compare_btn", use_container_width=True):
-                    if study_name:
-                        out_folder = st.session_state.get("cmp_out_input", main_folder)
-                        config[study_name.upper()] = {
-                            "template_path": main_folder,
-                            "output_path": out_folder,
-                        }
-                        save_study_config(config)
+                _new_study_key = (study_name or "").strip().upper()
+                if not _new_study_key:
+                    st.warning("Enter a **Study Name** above so this path is saved to the dropdown for future use.")
+                if st.button("Save & compare", type="primary", key="cmp_save_compare_btn",
+                             use_container_width=True, disabled=not _new_study_key):
+                    out_folder = st.session_state.get("cmp_out_input") or main_folder
+                    config[_new_study_key] = {
+                        "template_path": main_folder.strip(),
+                        "output_path": out_folder.strip(),
+                    }
+                    _save_err = save_study_config(config)
+                    if _save_err:
+                        st.session_state["_cmp_study_save_msg"] = ("error", f"Could not save study '{_new_study_key}': {_save_err}")
+                    else:
+                        # Switch the dropdown to the newly saved study on the next run
+                        st.session_state["_cmp_pending_study_select"] = _new_study_key
+                        st.session_state["_cmp_study_save_msg"] = ("success", f"Saved study '{_new_study_key}' — it will appear in the dropdown next time.")
                     st.session_state.cmp_findings = []
                     st.session_state.cmp_fixed = False
                     st.session_state["cmp_placed_done"] = False
